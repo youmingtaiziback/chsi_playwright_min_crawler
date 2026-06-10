@@ -22,6 +22,8 @@ import logging
 import os
 # 导入 re 库，用于从链接、脚本和 HTML 中提取学校 ID。
 import re
+# 导入 shlex，用于安全拼接可复现的 curl 命令。
+import shlex
 # 导入 time 库，用于耗时统计。
 import time
 # 导入 datetime，用于生成日志时间与文件元数据时间。
@@ -55,12 +57,12 @@ RAW_PAGES_FILE = OUTPUT_DIR / "chsi_school_pages_raw.json"
 COLLEGES_FILE = OUTPUT_DIR / "chsi_colleges.json"
 # 网络请求调试日志输出文件。
 NETWORK_LOG_FILE = OUTPUT_DIR / "chsi_network_log.json"
+# 列表页导航复现 curl 输出文件。
+WARMUP_CURL_FILE = OUTPUT_DIR / "chsi_warmup_goto.curl.sh"
 # 学校列表页：用于执行 JS 挑战并提取学校 ID。
 SCHOOL_LIST_URL = "https://gaokao.chsi.com.cn/wap/sch/schlist"
 # 院校库详情页：通过学校 ID 获取院校库信息。
 SCHOOL_INFO_URL = "https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}"
-# 桌面端院校库列表页兜底地址：用于 WAP schlist 的 /wap/sch/schsearch 异常时从 HTML 链接提取 schId。
-SCHOOL_DESKTOP_LIST_URL = "https://gaokao.chsi.com.cn/sch/search--ss-on,option-qg,searchType-1,start-{start}.dhtml"
 # 兼容旧命名：列表页同样承担预热 Cookie 与执行 JS 挑战的职责。
 WARMUP_URL = SCHOOL_LIST_URL
 
@@ -144,6 +146,8 @@ class ChsiSchoolCrawler:
         self.colleges: list[dict[str, Any]] = []
         # 用于保存每次页面访问的调试日志。
         self.network_logs: list[dict[str, Any]] = []
+        # 避免对同一个页面重复注册 schsearch 调试监听器。
+        self.schsearch_debug_attached = False
 
     # 判断页面或响应是否像阿里云 / WAF / JS 挑战页。
     def is_challenge_text(self, text: str) -> bool:
@@ -181,12 +185,84 @@ class ChsiSchoolCrawler:
         # 输出每个重点 Cookie 是否出现。
         logger.info("关键 Cookie 状态=%s", {name: name in names for name in important})
 
+    # 写出和 page.goto 列表页导航同源参数构造的 curl，便于在终端复现首跳请求。
+    async def write_warmup_goto_curl(self, context: BrowserContext, url: str, timeout_ms: int) -> None:
+        # page.goto 对列表页是 GET 导航；curl 中复用相同 URL 和 timeout，并附带当前上下文已有 Cookie。
+        cookies = await context.cookies(url)
+        cookie_header = "; ".join(f"{cookie.get('name')}={cookie.get('value')}" for cookie in cookies if cookie.get("name"))
+        command = [
+            "curl",
+            "--location",
+            "--request",
+            "GET",
+            "--max-time",
+            str(max(1, int(timeout_ms / 1000))),
+            "--compressed",
+            "--header",
+            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "--header",
+            "Accept-Language: zh-CN,zh;q=0.9",
+        ]
+        if cookie_header:
+            command.extend(["--header", f"Cookie: {cookie_header}"])
+        command.append(url)
+        curl_text = " ".join(shlex.quote(part) for part in command) + "\n"
+        WARMUP_CURL_FILE.write_text(curl_text, encoding="utf-8")
+        logger.info("已写出学校列表页 goto 复现 curl：%s", WARMUP_CURL_FILE)
+
+    # 监听 /wap/sch/schsearch 请求和响应，用日志定位“服务异常”的真实接口状态和响应摘要。
+    def attach_schsearch_debug_listeners(self, page: Page) -> None:
+        if self.schsearch_debug_attached:
+            return
+        self.schsearch_debug_attached = True
+
+        async def record_response(response: Any) -> None:
+            if "/wap/sch/schsearch" not in response.url:
+                return
+            request = response.request
+            post_data = request.post_data or ""
+            body_preview = ""
+            try:
+                body_preview = (await response.text())[:1000]
+            except Exception as exc:
+                body_preview = f"<读取响应正文失败：{exc}>"
+            log_item = {
+                "request": {
+                    "url": request.url,
+                    "method": request.method,
+                    "post_data": post_data[:1000],
+                    "mode": "schsearch_auto_by_page",
+                },
+                "response": {
+                    "status": response.status,
+                    "url": response.url,
+                    "ok": response.ok,
+                    "body_preview": body_preview,
+                },
+                "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            self.network_logs.append(log_item)
+            logger.warning(
+                "schsearch 响应：status=%s ok=%s post_data=%s body_preview=%s",
+                response.status,
+                response.ok,
+                post_data[:300],
+                body_preview[:300].replace("\n", " "),
+            )
+
+        page.on("response", lambda response: asyncio.create_task(record_response(response)))
+
     # 访问列表页，等待 JS 挑战自动完成并写入 Cookie。
     async def warmup(self, page: Page, context: BrowserContext) -> None:
         # 输出预热开始日志。
         logger.info("开始访问学校列表页：%s", SCHOOL_LIST_URL)
         # 访问列表页，等待 DOMContentLoaded 即可，不强求 networkidle，避免某些统计请求长时间挂起。
-        response = await page.goto(SCHOOL_LIST_URL, wait_until="domcontentloaded", timeout=60_000)
+        goto_url = SCHOOL_LIST_URL
+        goto_wait_until = "domcontentloaded"
+        goto_timeout = 60_000
+        # 在真正 page.goto 前写出同一 URL / timeout / 当前 Cookie 构造的 curl，便于复现首跳请求。
+        await self.write_warmup_goto_curl(context, goto_url, goto_timeout)
+        response = await page.goto(goto_url, wait_until=goto_wait_until, timeout=goto_timeout)
         # 如果拿到响应对象，则输出状态码。
         if response:
             logger.info("学校列表页响应：status=%s url=%s", response.status, response.url)
@@ -234,10 +310,6 @@ class ChsiSchoolCrawler:
         patterns = [
             r"/wap/sch/(?:schinfomain|schinfo|schdetail)/(\d+)",
             r"schinfomain/(\d+)",
-            # 桌面端院校库 HTML 常见链接：/sch/schoolInfo--schId-799%2CcategoryId-...dhtml。
-            r"schoolInfo(?:Main)?--schId-(\d+)",
-            # 部分页面/脚本使用查询参数形式传递 schId。
-            r"[?&,]schId=(\d+)",
             # schlist.html 源码中列表数据字段为 item.schId；接口 JSON 常见形式为 "schId": 123。
             r"[\"']?schId[\"']?\s*[:=]\s*[\"']?(\d+)",
         ]
@@ -281,9 +353,9 @@ class ChsiSchoolCrawler:
         return ids
 
     # 等待 schlist 源码中 mounted 自动触发的 Vue 列表请求结束。
-    async def wait_for_schlist_vue_data(self, page: Page) -> None:
+    async def wait_for_schlist_vue_data(self, page: Page) -> bool:
         # schlist.html 在 mounted 中已经会调用 this.getSchList()；这里不要再次主动调用，避免重复触发
-        # /wap/sch/schsearch 并弹出“服务异常”对话框。这里只观察 Vue 状态，必要时关闭错误弹窗后走兜底列表。
+        # /wap/sch/schsearch 并弹出“服务异常”对话框。这里只观察 Vue 状态，必要时关闭错误弹窗后等待重新导航。
         for attempt in range(1, 8):
             state = await page.evaluate(
                 """
@@ -311,16 +383,17 @@ class ChsiSchoolCrawler:
             dialog = str(state.get("dialog") or "")
             if state.get("listLength", 0) > 0:
                 logger.info("schlist Vue 列表数据已就绪：%s", state)
-                return
+                return True
             if dialog:
-                logger.warning("schlist 页面出现弹窗，停止等待 WAP 列表并准备兜底：%s", dialog.replace("\n", " | "))
+                logger.warning("schlist 页面出现弹窗，停止等待当前 WAP 列表：%s", dialog.replace("\n", " | "))
                 await self.close_page_dialog_if_present(page)
-                return
+                return False
             if state.get("hasVm") and not state.get("loading") and state.get("finished"):
-                logger.warning("schlist Vue 列表请求已结束但没有数据，准备兜底：%s", state)
-                return
+                logger.warning("schlist Vue 列表请求已结束但没有数据，准备重新加载：%s", state)
+                return False
             logger.info("等待 schlist mounted 列表请求：attempt=%s state=%s", attempt, state)
             await page.wait_for_timeout(1_000)
+        return False
 
     # 如果页面出现 Vant/浏览器弹窗，尝试点击确认关闭，避免遮挡后续页面操作。
     async def close_page_dialog_if_present(self, page: Page) -> bool:
@@ -447,49 +520,18 @@ class ChsiSchoolCrawler:
             return False
         return True
 
-    # 从桌面端院校库列表 HTML 兜底提取学校 ID，避免 WAP schsearch 异常导致完全无 ID。
-    async def collect_school_ids_from_desktop_pages(self, page: Page, seen: set[str]) -> list[str]:
-        fallback_ids: list[str] = []
-        # 桌面端列表使用 start 偏移；每页通常 20 条。这里复用 list_scroll_rounds 限制兜底页数。
-        for page_index in range(self.list_scroll_rounds):
-            start = page_index * 20
-            url = SCHOOL_DESKTOP_LIST_URL.format(start=start)
-            logger.info("WAP 列表无可用数据，尝试桌面端院校库列表兜底：url=%s", url)
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15_000)
-            except PlaywrightTimeoutError:
-                logger.info("桌面端院校库列表等待 networkidle 超时，继续解析：url=%s", url)
-            await page.wait_for_timeout(500)
-            html = await page.evaluate("() => document.documentElement.outerHTML")
-            current_ids = self.extract_school_ids_from_text(html)
-            added = 0
-            for school_id in current_ids:
-                if school_id not in seen:
-                    fallback_ids.append(school_id)
-                    seen.add(school_id)
-                    added += 1
-            if response:
-                self.network_logs.append(
-                    {
-                        "request": {"url": url, "method": "GET", "mode": "desktop_list_fallback"},
-                        "response": {"status": response.status, "url": response.url, "ok": response.ok},
-                        "recorded_at": datetime.now().isoformat(timespec="seconds"),
-                    }
-                )
-            logger.info("桌面端院校库列表兜底进度：page=%s added=%s total_added=%s", page_index + 1, added, len(fallback_ids))
-            if self.max_schools > 0 and len(seen) >= self.start + self.max_schools:
-                break
-            if added == 0:
-                break
-        return fallback_ids
-
     # 从 schlist 列表页获取学校 ID。
     async def collect_school_ids(self, page: Page, context: BrowserContext) -> list[str]:
         # 先访问列表页并执行挑战。
         await self.warmup(page, context)
         # schlist.html 的 mounted 会自动触发 getSchList；这里只等待结果，不再主动重复调用 schsearch。
-        await self.wait_for_schlist_vue_data(page)
+        list_ready = await self.wait_for_schlist_vue_data(page)
+        # 从日志看，首次无 storage_state 时 schsearch 可能早于挑战 Cookie 完成而弹“服务异常”。
+        # warmup 已经拿到 acw_tc / aliyungf_tc / CHSICC_CLIENTFLAGGAOKAO 后，重新导航一次让 mounted 自动重试。
+        if not list_ready:
+            logger.warning("首次 schlist 自动列表请求未成功；已完成 Cookie 预热，重新访问 WAP 列表页再等待一次")
+            await self.warmup(page, context)
+            await self.wait_for_schlist_vue_data(page)
         # 使用列表保持顺序，使用集合去重。
         school_ids: list[str] = []
         seen: set[str] = set()
@@ -526,14 +568,6 @@ class ChsiSchoolCrawler:
                     break
             else:
                 stale_rounds = 0
-        # 如果 WAP 列表因为“服务异常”等原因没有拿够 ID，则用桌面端院校库列表 HTML 兜底。
-        required_count = self.start + self.max_schools if self.max_schools > 0 else 1
-        if len(school_ids) < required_count:
-            fallback_ids = await self.collect_school_ids_from_desktop_pages(page, seen)
-            school_ids.extend(fallback_ids)
-            if fallback_ids:
-                logger.info("桌面端兜底补充学校 ID：added=%s total_ids=%s", len(fallback_ids), len(school_ids))
-
         # 如果 START 不为 0，则跳过前面的学校 ID，方便断点续跑。
         selected_ids = school_ids[self.start :]
         # 如果限制了最大学校数量，则截断。
@@ -705,6 +739,8 @@ class ChsiSchoolCrawler:
                 context = await browser.new_context(locale="zh-CN")
             # 创建一个页面，列表页和详情页都在同一页面/上下文中完成。
             page = await context.new_page()
+            # 记录 schsearch 自动请求/响应，便于定位服务异常。
+            self.attach_schsearch_debug_listeners(page)
             try:
                 # 从 schlist 页面提取学校 ID。
                 school_ids = await self.collect_school_ids(page, context)
