@@ -192,11 +192,14 @@ https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}
 
 ### 如何从 schlist 获取学校 ID？
 
-程序会访问 `schlist`，等待 DOMContentLoaded、networkidle 和额外渲染时间，然后滚动页面触发移动端懒加载。每轮都会从以下位置提取 ID：
+程序会访问 `schlist`，等待 DOMContentLoaded、networkidle 和额外渲染时间，然后按 `schlist.html` 源码中的 Vue 逻辑等待或主动触发 `getSchList()`，由页面自己请求 `/wap/sch/schsearch` 并把结果写入 `#app.__vue__.list`。每轮都会从以下位置提取 ID：
 
-- `a[href]` 中的 `/wap/sch/schinfomain/{id}`、`/wap/sch/schinfo/{id}` 等链接；
+- Vue 实例 `#app.__vue__.list` 中的 `item.schId` 字段（优先来源）；
+- `a[href]`、`url` 中的 `/wap/sch/schinfomain/{id}`、`/wap/sch/schinfo/{id}` 等链接；
 - `onclick`、`data-href`、`data-url` 等属性；
-- 页面 HTML / 内联脚本中的 `schId` 字段。
+- 页面 HTML / 内联脚本 / JSON 文本中的 `schId` 字段。
+
+翻页时会优先复用源码里的 `nextPageAvailable` 和 `getSchList()`，再滚动页面兜底触发移动端懒加载。
 
 ### Cookie 如何持久化？
 

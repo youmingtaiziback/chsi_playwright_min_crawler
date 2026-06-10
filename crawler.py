@@ -211,55 +211,158 @@ class ChsiSchoolCrawler:
         # 输出保存状态日志。
         logger.info("已保存 storage_state：%s", STATE_FILE)
 
-    # 从字符串中提取学校 ID，覆盖 schinfomain 链接、schinfo 链接和脚本中的 schId。
+    # 从字符串中提取学校 ID，覆盖 schinfomain 链接、schinfo 链接和脚本/JSON 中的 schId。
     def extract_school_ids_from_text(self, text: str) -> list[str]:
         # 使用列表保持发现顺序，使用集合去重。
         ids: list[str] = []
         seen: set[str] = set()
+
+        # 内部小工具：只收集纯数字 ID，并保持首次出现的顺序。
+        def add_school_id(value: str | int | None) -> None:
+            if value is None:
+                return
+            school_id = str(value).strip()
+            if not re.fullmatch(r"\d+", school_id):
+                return
+            if school_id not in seen:
+                ids.append(school_id)
+                seen.add(school_id)
+
         # 正则覆盖 /wap/sch/schinfomain/123、/wap/sch/schinfo/123 等链接。
         patterns = [
             r"/wap/sch/(?:schinfomain|schinfo|schdetail)/(\d+)",
             r"schinfomain/(\d+)",
-            r"schId[\"'\s:=]+(\d+)",
+            # schlist.html 源码中列表数据字段为 item.schId；接口 JSON 常见形式为 "schId": 123。
+            r"[\"']?schId[\"']?\s*[:=]\s*[\"']?(\d+)",
         ]
         # 逐个模式匹配。
         for pattern in patterns:
             for match in re.finditer(pattern, text):
-                school_id = match.group(1)
-                if school_id not in seen:
-                    ids.append(school_id)
-                    seen.add(school_id)
+                add_school_id(match.group(1))
         # 返回保持原始顺序的学校 ID。
         return ids
 
-    # 读取当前列表页 DOM，并从链接、onclick、HTML 中提取学校 ID。
+    # 从对象中递归提取 schId 字段，覆盖 Vue 实例 data.list 和 schsearch 接口 JSON。
+    def extract_school_ids_from_object(self, value: Any) -> list[str]:
+        # 使用列表保持发现顺序，使用集合去重。
+        ids: list[str] = []
+        seen: set[str] = set()
+
+        # 内部小工具：只收集纯数字 ID，并保持首次出现的顺序。
+        def add_school_id(raw_value: Any) -> None:
+            if raw_value is None:
+                return
+            school_id = str(raw_value).strip()
+            if not re.fullmatch(r"\d+", school_id):
+                return
+            if school_id not in seen:
+                ids.append(school_id)
+                seen.add(school_id)
+
+        # 递归遍历 dict/list，遇到 schId 立即收集。
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    if key == "schId":
+                        add_school_id(child)
+                    walk(child)
+            elif isinstance(node, list):
+                for child in node:
+                    walk(child)
+
+        walk(value)
+        # 返回保持原始顺序的学校 ID。
+        return ids
+
+    # 等待 schlist 源码中的 Vue 列表数据就绪；必要时主动调用 getSchList 触发 /wap/sch/schsearch。
+    async def wait_for_schlist_vue_data(self, page: Page) -> None:
+        # schlist.html 的 #app Vue 实例以 list 保存接口返回列表，getSchList 会请求 /wap/sch/schsearch。
+        for attempt in range(1, 6):
+            state = await page.evaluate(
+                """
+                async () => {
+                    const app = document.querySelector('#app');
+                    const vm = app && app.__vue__;
+                    if (!vm) {
+                        return {hasVm: false, listLength: 0, loading: false, nextPageAvailable: false};
+                    }
+                    if ((!Array.isArray(vm.list) || vm.list.length === 0) && typeof vm.getSchList === 'function' && !vm.loading) {
+                        vm.getSchList();
+                    }
+                    return {
+                        hasVm: true,
+                        listLength: Array.isArray(vm.list) ? vm.list.length : 0,
+                        loading: Boolean(vm.loading),
+                        nextPageAvailable: Boolean(vm.nextPageAvailable),
+                        startOfNextPage: vm.startOfNextPage
+                    };
+                }
+                """
+            )
+            if state.get("listLength", 0) > 0:
+                logger.info("schlist Vue 列表数据已就绪：%s", state)
+                return
+            logger.info("等待 schlist Vue 列表数据：attempt=%s state=%s", attempt, state)
+            await page.wait_for_timeout(1_000)
+
+    # 读取当前列表页 DOM、Vue 实例和页面源码，并提取学校 ID。
     async def extract_school_ids_from_page(self, page: Page) -> list[str]:
-        # 在页面中收集所有可能包含学校详情地址的 DOM 内容。
+        # 在页面中收集所有可能包含学校详情地址或 schId 的 DOM / Vue 内容。
         snapshot = await page.evaluate(
             """
             () => {
                 const attrs = [];
-                for (const node of document.querySelectorAll('a[href], [onclick], [data-href], [data-url]')) {
-                    for (const name of ['href', 'onclick', 'data-href', 'data-url']) {
+                for (const node of document.querySelectorAll('a[href], [onclick], [data-href], [data-url], [url]')) {
+                    for (const name of ['href', 'onclick', 'data-href', 'data-url', 'url']) {
                         const value = node.getAttribute(name);
                         if (value) attrs.push(value);
                     }
                 }
+                const app = document.querySelector('#app');
+                const vm = app && app.__vue__;
+                const vueState = vm ? {
+                    list: Array.isArray(vm.list) ? vm.list : [],
+                    startOfNextPage: vm.startOfNextPage,
+                    nextPageAvailable: Boolean(vm.nextPageAvailable),
+                    loading: Boolean(vm.loading),
+                    finished: Boolean(vm.finished)
+                } : null;
                 return {
                     url: location.href,
                     title: document.title,
                     attrs,
+                    vueState,
                     html: document.documentElement.outerHTML
                 };
             }
             """
         )
-        # 合并属性与 HTML 后统一用 Python 正则提取，便于后续维护。
+        # 使用列表保持不同来源的发现顺序，使用集合去重。
+        school_ids: list[str] = []
+        seen: set[str] = set()
+
+        # 内部小工具：合并某个来源提取到的 ID。
+        def extend_ids(values: list[str]) -> None:
+            for school_id in values:
+                if school_id not in seen:
+                    school_ids.append(school_id)
+                    seen.add(school_id)
+
+        # schlist.html 源码显示真实学校 ID 位于 Vue list 的 item.schId，优先读取渲染后的 Vue 状态。
+        extend_ids(self.extract_school_ids_from_object(snapshot.get("vueState")))
+        # 合并属性与 HTML 后统一用 Python 正则兜底提取，便于后续维护。
         combined = "\n".join(snapshot.get("attrs") or []) + "\n" + (snapshot.get("html") or "")
-        # 提取学校 ID。
-        school_ids = self.extract_school_ids_from_text(combined)
+        extend_ids(self.extract_school_ids_from_text(combined))
+        vue_state = snapshot.get("vueState") or {}
         # 输出当前页面提取结果。
-        logger.info("当前列表页提取学校 ID 数量=%s url=%s title=%s", len(school_ids), snapshot.get("url"), snapshot.get("title"))
+        logger.info(
+            "当前列表页提取学校 ID 数量=%s url=%s title=%s vue_list=%s next=%s",
+            len(school_ids),
+            snapshot.get("url"),
+            snapshot.get("title"),
+            len(vue_state.get("list") or []),
+            vue_state.get("nextPageAvailable"),
+        )
         # 返回学校 ID。
         return school_ids
 
@@ -282,10 +385,38 @@ class ChsiSchoolCrawler:
             """
         )
 
+
+    # 根据 schlist.html 中的 onLoad 逻辑，直接调用 Vue getSchList 加载下一页。
+    async def trigger_schlist_next_page(self, page: Page) -> bool:
+        # Vant van-list 滚动到底后实际执行 onLoad；onLoad 在 nextPageAvailable 为 true 时调用 getSchList。
+        state = await page.evaluate(
+            """
+            () => {
+                const app = document.querySelector('#app');
+                const vm = app && app.__vue__;
+                if (!vm || typeof vm.getSchList !== 'function') {
+                    return {triggered: false, reason: 'no-vue-getSchList'};
+                }
+                if (vm.loading) {
+                    return {triggered: false, reason: 'loading', startOfNextPage: vm.startOfNextPage};
+                }
+                if (!vm.nextPageAvailable) {
+                    return {triggered: false, reason: 'no-next-page', startOfNextPage: vm.startOfNextPage};
+                }
+                vm.getSchList();
+                return {triggered: true, startOfNextPage: vm.startOfNextPage};
+            }
+            """
+        )
+        logger.info("触发 schlist 下一页状态：%s", state)
+        return bool(state.get("triggered"))
+
     # 从 schlist 列表页获取学校 ID。
     async def collect_school_ids(self, page: Page, context: BrowserContext) -> list[str]:
         # 先访问列表页并执行挑战。
         await self.warmup(page, context)
+        # schlist.html 通过 Vue getSchList 请求 /wap/sch/schsearch 后把结果放入 list，先等待或主动触发一次。
+        await self.wait_for_schlist_vue_data(page)
         # 使用列表保持顺序，使用集合去重。
         school_ids: list[str] = []
         seen: set[str] = set()
@@ -308,12 +439,13 @@ class ChsiSchoolCrawler:
             if self.max_schools > 0 and len(school_ids) >= self.start + self.max_schools:
                 logger.info("已提取到 START + MAX_SCHOOLS 所需数量，停止滚动列表页")
                 break
-            # 尝试点击加载更多，再滚动到底部。
+            # 按 schlist.html 的真实 onLoad/getSchList 逻辑主动加载下一页，再滚动兜底触发 Vant 懒加载。
+            triggered_next_page = await self.trigger_schlist_next_page(page)
             clicked = await self.click_load_more_if_present(page)
             await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1_500)
-            # 如果连续 3 轮既没有新增 ID，也没有可点击加载更多，则认为列表已到底。
-            if added == 0 and not clicked:
+            # 如果连续 3 轮既没有新增 ID，也没有主动触发下一页/可点击加载更多，则认为列表已到底。
+            if added == 0 and not clicked and not triggered_next_page:
                 stale_rounds += 1
                 if stale_rounds >= 3:
                     logger.info("列表页连续 %s 轮没有新增学校 ID，停止滚动", stale_rounds)
