@@ -30,6 +30,8 @@ import time
 from datetime import datetime
 # 导入 Path，用于跨平台处理文件路径。
 from pathlib import Path
+# 导入 URL 解析工具，用于识别和规范化被追加随机参数的 WAP 接口 URL。
+from urllib.parse import urlsplit, urlunsplit
 # 导入类型注解，方便理解参数与返回值结构。
 from typing import Any
 
@@ -154,6 +156,8 @@ class ChsiSchoolCrawler:
         self.schsearch_debug_attached = False
         # 避免对同一个页面重复注入 getSchList 探针。
         self.get_schlist_probe_installed = False
+        # 避免对同一个页面重复安装 WAP 接口 URL 规范化路由。
+        self.wap_api_route_installed = False
         # warmup 期间的请求、响应、console、弹窗等诊断事件。
         self.warmup_debug_events: list[dict[str, Any]] = []
 
@@ -261,6 +265,45 @@ class ChsiSchoolCrawler:
         # 保留最近 300 条，足够覆盖 schlist 首屏和 schsearch 失败链路。
         if len(self.warmup_debug_events) > 300:
             self.warmup_debug_events = self.warmup_debug_events[-300:]
+
+    # 判断 URL 是否是会被随机参数污染后返回 400 的 WAP 列表接口。
+    def is_wap_school_api_url(self, url: str) -> bool:
+        parsed = urlsplit(url)
+        return parsed.netloc == "gaokao.chsi.com.cn" and parsed.path in {"/wap/sch/schsearch", "/wap/sch/querycondition"}
+
+    # 移除 WAF/脚本追加到 WAP 列表接口上的随机查询参数，避免 schsearch/querycondition 因 URL 变形返回 400。
+    def normalize_wap_school_api_url(self, url: str) -> str:
+        parsed = urlsplit(url)
+        if not self.is_wap_school_api_url(url) or not parsed.query:
+            return url
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", parsed.fragment))
+
+    # 在页面请求发出前规范化 WAP 列表接口 URL；保留 method、headers、post_data，仅移除随机 query。
+    async def install_wap_api_url_normalizer(self, page: Page) -> None:
+        if self.wap_api_route_installed:
+            return
+        self.wap_api_route_installed = True
+
+        async def normalize_route(route: Any) -> None:
+            request = route.request
+            normalized_url = self.normalize_wap_school_api_url(request.url)
+            if normalized_url != request.url:
+                event = {
+                    "event": "wap_api_url_normalized",
+                    "original_url": request.url,
+                    "normalized_url": normalized_url,
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "post_data": (request.post_data or "")[:2000],
+                }
+                self.append_warmup_debug_event(event)
+                logger.warning("规范化 WAP 接口 URL，移除随机 query：%s -> %s", request.url, normalized_url)
+                await route.continue_(url=normalized_url)
+                return
+            await route.continue_()
+
+        await page.route("**/wap/sch/schsearch**", normalize_route)
+        await page.route("**/wap/sch/querycondition**", normalize_route)
 
     # 在页面脚本执行前注入探针，监听 schlist.html 中 this.getSchList() 是否自动触发。
     async def install_get_schlist_probe(self, page: Page) -> None:
@@ -638,6 +681,31 @@ class ChsiSchoolCrawler:
         get_schlist_api_results = [event for event in get_schlist_events if event.get("event") in {"api.syncAjax.resolved", "api.syncAjax.rejected"}]
         schsearch_events = [event for event in self.warmup_debug_events if "/wap/sch/schsearch" in str(event.get("url", ""))]
         failed_events = [event for event in schsearch_events if event.get("event") in {"response", "requestfailed"} and (event.get("status", 200) >= 400 or event.get("failure") or "服务异常" in str(event.get("body_preview", "")))]
+        rewritten_api_400_events = [
+            event
+            for event in self.warmup_debug_events
+            if event.get("event") == "response"
+            and event.get("status") == 400
+            and ("/wap/sch/schsearch?" in str(event.get("url", "")) or "/wap/sch/querycondition?" in str(event.get("url", "")))
+        ]
+        normalized_events = [event for event in self.warmup_debug_events if event.get("event") == "wap_api_url_normalized"]
+        document_400_events = [
+            event
+            for event in self.warmup_debug_events
+            if event.get("event") == "response"
+            and event.get("resource_type") == "document"
+            and event.get("status") == 400
+            and str(event.get("url", "")).rstrip("/").endswith("/wap/sch/schlist")
+        ]
+        if normalized_events:
+            latest = normalized_events[-1]
+            return f"检测到 WAP 接口 URL 被追加随机 query，已在路由层规范化：{latest.get('original_url')} -> {latest.get('normalized_url')}。如果仍失败，请查看规范化后的 response。"
+        if rewritten_api_400_events:
+            latest = rewritten_api_400_events[-1]
+            return f"400 原因明确：WAP 接口被追加随机 query 后请求，服务端拒绝。url={latest.get('url')}；应移除 query 后请求原始接口。"
+        if document_400_events:
+            latest = document_400_events[-1]
+            return f"schlist 主文档本身返回 400：url={latest.get('url')}；通常是当前 Cookie/风控状态已被标记，需要清理 storage_state 或重新完成挑战。"
         if "服务异常" in dialog_text and failed_events:
             latest = failed_events[-1]
             return f"this.getSchList 已触发 {len(get_schlist_calls)} 次；/wap/sch/schsearch 请求失败或返回服务异常；status={latest.get('status')} failure={latest.get('failure')}，详情见 diagnostics events 和 snapshot.getSchListEvents。"
@@ -658,7 +726,8 @@ class ChsiSchoolCrawler:
     async def warmup(self, page: Page, context: BrowserContext) -> None:
         # 输出预热开始日志。
         logger.info("开始访问学校列表页：%s", SCHOOL_LIST_URL)
-        # 确保即使单独调用 warmup，也会先注入 getSchList 探针并注册诊断监听器，再发起导航。
+        # 确保即使单独调用 warmup，也会先安装 URL 规范化、注入 getSchList 探针并注册诊断监听器，再发起导航。
+        await self.install_wap_api_url_normalizer(page)
         await self.install_get_schlist_probe(page)
         self.attach_schsearch_debug_listeners(page)
         # 访问列表页，等待 DOMContentLoaded 即可，不强求 networkidle，避免某些统计请求长时间挂起。

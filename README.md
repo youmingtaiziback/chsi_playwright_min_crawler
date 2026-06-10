@@ -213,6 +213,8 @@ https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}
 
 同时会保存 `output/chsi_warmup_page.html` 作为页面现场快照。优先查看 diagnostics 中 `snapshot.getSchListEvents`：如果没有 `getSchList.call`，说明 `this.getSchList()` 没有自动触发；如果有 `getSchList.call`，继续看同一 `callId` 下的 `api.syncAjax.call` 和 `api.syncAjax.resolved/rejected`，其中会包含完整参数和响应结果。再结合 `/wap/sch/schsearch` 的 `body_preview` 判断是否为 `flag=false`、`服务异常`、非 JSON 或风控页。
 
+如果 diagnostics 中出现 `/wap/sch/schsearch?随机参数=...` 或 `/wap/sch/querycondition?随机参数=...` 且状态码为 400，原因是页面/风控脚本把 WAP 接口 URL 从源码中的原始路径改写成了带随机 query 的地址，而服务端不接受这个变形后的接口 URL。程序会在 Playwright route 层记录 `wap_api_url_normalized` 事件，并把这两个 WAP 接口规范化回无 query 的原始 URL 后继续请求，便于验证是否就是 URL 改写导致的 400。
+
 ### Cookie 如何持久化？
 
 Playwright 的：
