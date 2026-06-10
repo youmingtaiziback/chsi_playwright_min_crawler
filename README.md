@@ -188,7 +188,7 @@ https://gaokao.chsi.com.cn/wap/sch/schlist
 https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}
 ```
 
-这样每个详情页都由真实 Chromium 以页面导航方式打开，能执行详情页上的 JS 和可能出现的挑战脚本。WAP 页面自身的 `mounted/getSchList` 仍可能自动请求 `/wap/sch/schsearch`，但程序不再额外主动重复调用它；如果首次请求早于挑战 Cookie 完成而弹出“服务异常”，会关闭弹窗，在 Cookie 预热完成后重新进入 WAP 列表页，让页面自身再自动请求一次。
+这样每个详情页都由真实 Chromium 以页面导航方式打开，能执行详情页上的 JS 和可能出现的挑战脚本。WAP 页面自身的 `mounted/getSchList` 仍可能自动请求 `/wap/sch/schsearch`，但程序不再在页面刚加载时额外重复调用它；如果首次请求早于挑战 Cookie 完成而弹出“服务异常”，会关闭弹窗，在 Cookie 预热完成后重新进入 WAP 列表页，让页面自身再自动请求一次。若自动请求仍失败，程序会在同源页面上下文中用 `schlist.html` 的同一套 `postdata` 补发 WAP `schsearch`，并把成功结果写回 `#app.__vue__.list`，便于后续统一提取。
 
 ### 如何从 schlist 获取学校 ID？
 
@@ -199,7 +199,7 @@ https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}
 - `onclick`、`data-href`、`data-url` 等属性；
 - 页面 HTML / 内联脚本 / JSON 文本中的 `schId` 字段。
 
-翻页时会优先滚动页面，让 Vant `van-list` 自然触发源码里的 `onLoad`。程序不会加入桌面端列表 HTML 兜底，以免掩盖 WAP 列表页自身的问题；如果仍未拿到 ID，会保留 `chsi_network_log.json` 和 `chsi_warmup_goto.curl.sh` 供定位。
+翻页时会优先滚动页面，让 Vant `van-list` 自然触发源码里的 `onLoad`；如果懒加载没有触发，也会用同源 WAP `schsearch` 按当前 `startOfNextPage` 补取下一页。程序不会加入桌面端列表 HTML 兜底，以免掩盖 WAP 列表页自身的问题；如果仍未拿到 ID，会保留 `chsi_network_log.json` 和 `chsi_warmup_goto.curl.sh` 供定位。
 
 ### Cookie 如何持久化？
 

@@ -186,8 +186,9 @@ class ChsiSchoolCrawler:
         logger.info("关键 Cookie 状态=%s", {name: name in names for name in important})
 
     # 写出和 page.goto 列表页导航同源参数构造的 curl，便于在终端复现首跳请求。
-    async def write_warmup_goto_curl(self, context: BrowserContext, url: str, timeout_ms: int) -> None:
-        # page.goto 对列表页是 GET 导航；curl 中复用相同 URL 和 timeout，并附带当前上下文已有 Cookie。
+    async def write_warmup_goto_curl(self, page: Page, context: BrowserContext, url: str, wait_until: str, timeout_ms: int) -> None:
+        # page.goto 对列表页是 GET 导航；curl 中复用相同 URL、timeout、当前 User-Agent 和当前上下文已有 Cookie。
+        user_agent = await page.evaluate("() => navigator.userAgent")
         cookies = await context.cookies(url)
         cookie_header = "; ".join(f"{cookie.get('name')}={cookie.get('value')}" for cookie in cookies if cookie.get("name"))
         command = [
@@ -199,6 +200,8 @@ class ChsiSchoolCrawler:
             str(max(1, int(timeout_ms / 1000))),
             "--compressed",
             "--header",
+            f"User-Agent: {user_agent}",
+            "--header",
             "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "--header",
             "Accept-Language: zh-CN,zh;q=0.9",
@@ -206,7 +209,7 @@ class ChsiSchoolCrawler:
         if cookie_header:
             command.extend(["--header", f"Cookie: {cookie_header}"])
         command.append(url)
-        curl_text = " ".join(shlex.quote(part) for part in command) + "\n"
+        curl_text = f"# page.goto wait_until={wait_until} timeout_ms={timeout_ms}\n" + " ".join(shlex.quote(part) for part in command) + "\n"
         WARMUP_CURL_FILE.write_text(curl_text, encoding="utf-8")
         logger.info("已写出学校列表页 goto 复现 curl：%s", WARMUP_CURL_FILE)
 
@@ -261,7 +264,7 @@ class ChsiSchoolCrawler:
         goto_wait_until = "domcontentloaded"
         goto_timeout = 60_000
         # 在真正 page.goto 前写出同一 URL / timeout / 当前 Cookie 构造的 curl，便于复现首跳请求。
-        await self.write_warmup_goto_curl(context, goto_url, goto_timeout)
+        await self.write_warmup_goto_curl(page, context, goto_url, goto_wait_until, goto_timeout)
         response = await page.goto(goto_url, wait_until=goto_wait_until, timeout=goto_timeout)
         # 如果拿到响应对象，则输出状态码。
         if response:
@@ -393,6 +396,80 @@ class ChsiSchoolCrawler:
                 return False
             logger.info("等待 schlist mounted 列表请求：attempt=%s state=%s", attempt, state)
             await page.wait_for_timeout(1_000)
+        return False
+
+    # 在 WAP 页面上下文中按 schlist.html 的 postdata 结构补发一次 schsearch，并把成功结果写回 Vue list。
+    async def fetch_schsearch_into_vue(self, page: Page) -> bool:
+        # 只在页面自动 mounted/getSchList 失败后使用；仍然使用 WAP 页同源 fetch、当前 Cookie 和同一套参数。
+        result = await page.evaluate(
+            """
+            async () => {
+                const app = document.querySelector('#app');
+                const vm = app && app.__vue__;
+                if (!vm) {
+                    return {ok: false, reason: 'no-vue'};
+                }
+                const zgsxTem = Array.isArray(vm.zgsxTem) ? vm.zgsxTem : [];
+                const postdata = {
+                    start: vm.startOfNextPage || 0,
+                    yxmc: vm.yxmc || '',
+                    yxls: vm.yxls || '',
+                    ssdm: vm.ssdm || '',
+                    zgsx: zgsxTem.length > 0 ? zgsxTem[0] : '',
+                    yxjbz: vm.yxjbzValue2 || '',
+                    bxlx: vm.bxlx || '',
+                    xlcc: vm.xlcc || ''
+                };
+                const body = new URLSearchParams();
+                Object.keys(postdata).forEach((key) => body.append(key, postdata[key] == null ? '' : String(postdata[key])));
+                const response = await fetch('/wap/sch/schsearch', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'Accept': 'application/json, text/javascript, */*; q=0.01',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body
+                });
+                const text = await response.text();
+                let data = null;
+                try {
+                    data = JSON.parse(text);
+                } catch (error) {
+                    return {ok: false, reason: 'json-parse-failed', status: response.status, postdata, textPreview: text.slice(0, 500)};
+                }
+                if (!data || !data.flag || !data.msg || !Array.isArray(data.msg.list)) {
+                    return {ok: false, reason: 'api-flag-false', status: response.status, postdata, data};
+                }
+                vm.list = Array.isArray(vm.list) ? vm.list.concat(data.msg.list) : data.msg.list;
+                vm.loading = false;
+                vm.nextPageAvailable = Boolean(data.msg.nextPageAvailable);
+                vm.startOfNextPage = data.msg.startOfNextPage;
+                vm.finished = !vm.nextPageAvailable;
+                return {
+                    ok: true,
+                    status: response.status,
+                    added: data.msg.list.length,
+                    total: Array.isArray(vm.list) ? vm.list.length : 0,
+                    nextPageAvailable: vm.nextPageAvailable,
+                    startOfNextPage: vm.startOfNextPage,
+                    postdata
+                };
+            }
+            """
+        )
+        if result.get("ok"):
+            logger.info("schsearch 同源 fetch 恢复成功：%s", result)
+            return True
+        logger.warning("schsearch 同源 fetch 恢复失败：%s", result)
+        self.network_logs.append(
+            {
+                "request": {"url": "/wap/sch/schsearch", "method": "POST", "mode": "schsearch_same_origin_recovery", "post_data": result.get("postdata")},
+                "response": {"status": result.get("status"), "ok": False, "body_preview": result.get("textPreview") or result.get("data")},
+                "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
         return False
 
     # 如果页面出现 Vant/浏览器弹窗，尝试点击确认关闭，避免遮挡后续页面操作。
@@ -531,7 +608,10 @@ class ChsiSchoolCrawler:
         if not list_ready:
             logger.warning("首次 schlist 自动列表请求未成功；已完成 Cookie 预热，重新访问 WAP 列表页再等待一次")
             await self.warmup(page, context)
-            await self.wait_for_schlist_vue_data(page)
+            list_ready = await self.wait_for_schlist_vue_data(page)
+        # 如果页面 mounted 自动请求仍失败，则在同源页面上下文中用相同 postdata 补发一次，避免空列表直接终止。
+        if not list_ready:
+            await self.fetch_schsearch_into_vue(page)
         # 使用列表保持顺序，使用集合去重。
         school_ids: list[str] = []
         seen: set[str] = set()
@@ -559,6 +639,8 @@ class ChsiSchoolCrawler:
             clicked = await self.click_load_more_if_present(page)
             await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
             loaded_next_page = await self.wait_for_schlist_lazy_page(page, previous_length)
+            if not loaded_next_page:
+                loaded_next_page = await self.fetch_schsearch_into_vue(page)
             await page.wait_for_timeout(500)
             # 如果连续 3 轮既没有新增 ID，也没有可点击/懒加载更多，则认为 WAP 列表已到底或不可用。
             if added == 0 and not clicked and not loaded_next_page:
