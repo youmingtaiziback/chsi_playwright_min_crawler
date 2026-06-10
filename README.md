@@ -2,20 +2,26 @@
 
 ## 功能
 
-本项目使用 Playwright 通过真实 Chromium 浏览器访问阳光高考 WAP 院校库页面，自动执行页面内 JS，获取阿里云/站点 Cookie，然后在同一个 BrowserContext 内通过 `fetch(..., {credentials: 'include'})` 请求：
+本项目使用 Playwright 通过真实 Chromium 浏览器访问阳光高考 WAP 院校库页面，自动执行页面内 JS，获取阿里云/站点 Cookie。当前抓取策略已调整为：
+
+1. 访问学校列表页并从页面 DOM/链接/脚本中提取学校 ID：
 
 ```text
-https://gaokao.chsi.com.cn/wap/sch/schsearch?start=0
-https://gaokao.chsi.com.cn/wap/sch/schsearch?start=10
-...
+https://gaokao.chsi.com.cn/wap/sch/schlist
+```
+
+2. 根据学校 ID 逐个访问院校库详情页，并从渲染后的页面中提取院校库信息：
+
+```text
+https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}
 ```
 
 最终输出：
 
 ```text
-output/chsi_colleges.json             标准化后的院校列表
-output/chsi_school_pages_raw.json     每页原始 JSON
-output/chsi_network_log.json          每次请求/响应日志
+output/chsi_colleges.json             标准化后的院校库信息
+output/chsi_school_pages_raw.json     列表页 ID 与每个详情页原始信息
+output/chsi_network_log.json          每次页面访问日志
 logs/crawler.log                      全流程运行日志
 storage_state.json                    Playwright Cookie/状态缓存
 ```
@@ -127,17 +133,19 @@ HEADLESS=true python crawler.py
 | 变量 | 默认值 | 含义 |
 |---|---:|---|
 | HEADLESS | false | 是否无头运行，首次建议 false |
-| START | 0 | 起始分页偏移量 |
-| MAX_PAGES | 0 | 最大抓取页数，0 表示不限制 |
-| REQUEST_INTERVAL_SECONDS | 1.0 | 每页请求间隔 |
+| START | 0 | 从提取到的学校 ID 列表中跳过多少个，便于断点续跑 |
+| MAX_SCHOOLS | 0 | 最多抓取多少个学校，0 表示不限制 |
+| MAX_PAGES | 0 | 兼容旧变量；未设置 MAX_SCHOOLS 时作为 MAX_SCHOOLS 使用 |
+| LIST_SCROLL_ROUNDS | 80 | 在 schlist 列表页最多滚动多少轮以触发懒加载 |
+| REQUEST_INTERVAL_SECONDS | 1.0 | 每个详情页请求间隔 |
 
-示例：只抓前 3 页：
+示例：只抓前 3 个学校详情页：
 
 ```bash
-HEADLESS=false MAX_PAGES=3 python crawler.py
+HEADLESS=false MAX_SCHOOLS=3 python crawler.py
 ```
 
-从第 2 页开始抓：
+从提取到的第 11 个学校开始抓：
 
 ```bash
 START=10 python crawler.py
@@ -149,62 +157,46 @@ START=10 python crawler.py
 
 ```json
 {
-  "sch_id": "1",
-  "sch_info_id": "99617187",
-  "school_code": "10001",
+  "school_id": "1",
   "name": "北京大学",
-  "province": "北京",
-  "authority": "教育部",
-  "school_type": "综合院校",
-  "education_level": "本科",
-  "is_double_first_class_university": true,
-  "is_double_first_class_subject": false,
-  "has_master_degree": true,
-  "has_doctor_degree": true,
-  "satisfaction_score": 4.6,
-  "source": "chsi_gaokao_schsearch",
-  "source_url": "https://gaokao.chsi.com.cn/wap/sch/schsearch?start={start}",
+  "source": "chsi_gaokao_schinfomain",
+  "source_url": "https://gaokao.chsi.com.cn/wap/sch/schinfomain/1",
+  "final_url": "https://gaokao.chsi.com.cn/wap/sch/schinfomain/1",
+  "title": "北京大学_阳光高考",
+  "fields": {
+    "院校所在地": "北京",
+    "院校类型": "综合"
+  },
+  "text": "页面正文文本",
   "raw": {}
 }
 ```
 
 ## 原理说明
 
-### 为什么先访问 schlist？
+### 为什么不再调用 schsearch？
 
-直接访问 `schsearch` 可能缺少 Cookie，容易出现：
-
-```text
-400 Bad Request
-403 Forbidden
-空 HTML
-阿里云 JS 挑战页
-```
-
-所以程序先访问：
+`schsearch?start=...` 在部分环境下会被风控重写为随机参数 URL，并返回 `400 Bad Request` 或空 HTML。当前策略改为先从 WAP 列表页：
 
 ```text
 https://gaokao.chsi.com.cn/wap/sch/schlist
 ```
 
-让真实 Chromium 自动执行页面 JS，完成 Cookie 写入。
-
-### 为什么不用 page.goto 访问 schsearch？
-
-`page.goto()` 会把接口当作页面导航请求：
+提取页面中出现的学校 ID，再逐个访问：
 
 ```text
-resource_type=document
-is_navigation_request=true
+https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}
 ```
 
-更推荐在页面上下文里执行：
+这样每个详情页都由真实 Chromium 以页面导航方式打开，能执行详情页上的 JS 和可能出现的挑战脚本，同时避免依赖容易被拦截的 `schsearch` JSON 接口。
 
-```javascript
-fetch(url, { credentials: 'include' })
-```
+### 如何从 schlist 获取学校 ID？
 
-这样会自动携带当前 BrowserContext Cookie，更接近页面内 AJAX 请求。
+程序会访问 `schlist`，等待 DOMContentLoaded、networkidle 和额外渲染时间，然后滚动页面触发移动端懒加载。每轮都会从以下位置提取 ID：
+
+- `a[href]` 中的 `/wap/sch/schinfomain/{id}`、`/wap/sch/schinfo/{id}` 等链接；
+- `onclick`、`data-href`、`data-url` 等属性；
+- 页面 HTML / 内联脚本中的 `schId` 字段。
 
 ### Cookie 如何持久化？
 
@@ -224,7 +216,7 @@ browser.new_context(storage_state="storage_state.json")
 
 ## 常见问题
 
-### 1. 返回 400 / 403 怎么办？
+### 1. 返回 400 / 403 或出现验证页怎么办？
 
 优先尝试：
 
@@ -232,9 +224,9 @@ browser.new_context(storage_state="storage_state.json")
 HEADLESS=false python crawler.py
 ```
 
-然后观察浏览器是否出现验证页。程序会自动重新 warmup 并重试一次。
+然后观察浏览器是否出现验证页。程序会在抓取列表页和每个详情页前后保存 Cookie 状态，便于后续复用。
 
-### 2. JSON 解析失败怎么办？
+### 2. 没有提取到学校 ID 怎么办？
 
 查看：
 
@@ -243,7 +235,7 @@ logs/crawler.log
 output/chsi_network_log.json
 ```
 
-重点看 `bodyText` 前几百个字符，判断是 HTML、空响应还是挑战页。
+重点确认 `schlist` 是否正常渲染、是否出现验证页，以及是否需要调大 `LIST_SCROLL_ROUNDS` 或先用 `HEADLESS=false` 完成一次挑战。
 
 ### 3. 服务器部署怎么跑？
 
@@ -266,21 +258,14 @@ PostgreSQL 表结构可参考：
 ```sql
 CREATE TABLE colleges (
   id BIGSERIAL PRIMARY KEY,
-  sch_id VARCHAR(32) UNIQUE NOT NULL,
-  sch_info_id VARCHAR(32),
-  school_code VARCHAR(32),
-  name VARCHAR(128) NOT NULL,
-  province VARCHAR(32),
-  authority VARCHAR(128),
-  school_type VARCHAR(64),
-  education_level VARCHAR(32),
-  is_double_first_class_university BOOLEAN,
-  is_double_first_class_subject BOOLEAN,
-  has_master_degree BOOLEAN,
-  has_doctor_degree BOOLEAN,
-  satisfaction_score NUMERIC(3,1),
+  school_id VARCHAR(32) UNIQUE NOT NULL,
+  name VARCHAR(128),
   source VARCHAR(64),
   source_url TEXT,
+  final_url TEXT,
+  title TEXT,
+  fields JSONB,
+  text TEXT,
   raw JSONB,
   created_at TIMESTAMP DEFAULT now(),
   updated_at TIMESTAMP DEFAULT now()
