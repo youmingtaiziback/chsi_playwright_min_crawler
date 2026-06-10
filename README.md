@@ -207,10 +207,11 @@ https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}
 
 - 关键请求/响应的 URL、方法、资源类型、状态码、POST data 和响应正文预览；
 - Vant 弹窗文本、Vue `#app.__vue__` 状态、`listLength/loading/finished/nextPageAvailable/startOfNextPage`；
+- `snapshot.getSchListEvents`：页面脚本执行前注入的探针会包装根 Vue 实例的 `this.getSchList()`，记录它是否被自动触发、触发时完整 `postdata`、调用前后 Vue 状态，以及内部 `api.syncAjax` 的完整响应/异常；
 - 当前 Cookie 名称和关键 Performance ResourceTiming；
-- `probable_cause` 字段会根据弹窗和 `schsearch` 响应粗略判断原因。
+- `probable_cause` 字段会根据弹窗、`getSchList` 调用和 `schsearch` 响应粗略判断原因。
 
-同时会保存 `output/chsi_warmup_page.html` 作为页面现场快照。优先查看 diagnostics 中 `/wap/sch/schsearch` 的 `body_preview`：如果里面是 `flag=false` 或 `服务异常`，说明主文档没问题，失败点是列表接口响应。
+同时会保存 `output/chsi_warmup_page.html` 作为页面现场快照。优先查看 diagnostics 中 `snapshot.getSchListEvents`：如果没有 `getSchList.call`，说明 `this.getSchList()` 没有自动触发；如果有 `getSchList.call`，继续看同一 `callId` 下的 `api.syncAjax.call` 和 `api.syncAjax.resolved/rejected`，其中会包含完整参数和响应结果。再结合 `/wap/sch/schsearch` 的 `body_preview` 判断是否为 `flag=false`、`服务异常`、非 JSON 或风控页。
 
 ### Cookie 如何持久化？
 

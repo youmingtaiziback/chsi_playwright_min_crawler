@@ -152,6 +152,8 @@ class ChsiSchoolCrawler:
         self.network_logs: list[dict[str, Any]] = []
         # 避免对同一个页面重复注册 schsearch / warmup 调试监听器。
         self.schsearch_debug_attached = False
+        # 避免对同一个页面重复注入 getSchList 探针。
+        self.get_schlist_probe_installed = False
         # warmup 期间的请求、响应、console、弹窗等诊断事件。
         self.warmup_debug_events: list[dict[str, Any]] = []
 
@@ -260,6 +262,181 @@ class ChsiSchoolCrawler:
         if len(self.warmup_debug_events) > 300:
             self.warmup_debug_events = self.warmup_debug_events[-300:]
 
+    # 在页面脚本执行前注入探针，监听 schlist.html 中 this.getSchList() 是否自动触发。
+    async def install_get_schlist_probe(self, page: Page) -> None:
+        if self.get_schlist_probe_installed:
+            return
+        self.get_schlist_probe_installed = True
+        await page.add_init_script(
+            """
+            (() => {
+                if (window.__chsiGetSchListProbeInstalled) return;
+                window.__chsiGetSchListProbeInstalled = true;
+                window.__chsiGetSchListEvents = [];
+                window.__chsiGetSchListSeq = 0;
+                window.__chsiCurrentGetSchListCallId = null;
+
+                const now = () => new Date().toISOString();
+                const safeClone = (value) => {
+                    try { return JSON.parse(JSON.stringify(value)); } catch (error) { return String(value); }
+                };
+                const vueState = (vm) => vm ? {
+                    listLength: Array.isArray(vm.list) ? vm.list.length : 0,
+                    loading: Boolean(vm.loading),
+                    finished: Boolean(vm.finished),
+                    error: Boolean(vm.error),
+                    nextPageAvailable: Boolean(vm.nextPageAvailable),
+                    startOfNextPage: vm.startOfNextPage
+                } : null;
+                const calcPostdata = (vm) => {
+                    const zgsxTem = Array.isArray(vm && vm.zgsxTem) ? vm.zgsxTem : [];
+                    return {
+                        start: (vm && vm.startOfNextPage) || 0,
+                        yxmc: (vm && vm.yxmc) || '',
+                        yxls: (vm && vm.yxls) || '',
+                        ssdm: (vm && vm.ssdm) || '',
+                        zgsx: zgsxTem.length > 0 ? zgsxTem[0] : '',
+                        yxjbz: (vm && vm.yxjbzValue2) || '',
+                        bxlx: (vm && vm.bxlx) || '',
+                        xlcc: (vm && vm.xlcc) || ''
+                    };
+                };
+                const emit = (event) => {
+                    const item = Object.assign({recordedAt: now()}, event);
+                    window.__chsiGetSchListEvents.push(item);
+                    if (window.__chsiGetSchListEvents.length > 100) {
+                        window.__chsiGetSchListEvents = window.__chsiGetSchListEvents.slice(-100);
+                    }
+                    try { console.info('[chsi-getSchList] ' + JSON.stringify(item)); } catch (error) {}
+                };
+                const installApiWrapper = (api) => {
+                    if (!api || typeof api.syncAjax !== 'function' || api.__chsiSyncAjaxWrapped) return;
+                    const originalSyncAjax = api.syncAjax;
+                    api.__chsiSyncAjaxWrapped = true;
+                    api.syncAjax = function(method, url, options) {
+                        const callId = window.__chsiCurrentGetSchListCallId;
+                        const eventBase = {
+                            event: 'api.syncAjax.call',
+                            callId,
+                            method,
+                            url,
+                            options: safeClone(options || null)
+                        };
+                        emit(eventBase);
+                        const result = originalSyncAjax.apply(this, arguments);
+                        if (result && typeof result.then === 'function') {
+                            result.then(
+                                (data) => emit({
+                                    event: 'api.syncAjax.resolved',
+                                    callId,
+                                    method,
+                                    url,
+                                    response: safeClone(data)
+                                }),
+                                (error) => emit({
+                                    event: 'api.syncAjax.rejected',
+                                    callId,
+                                    method,
+                                    url,
+                                    error: String(error && (error.stack || error.message || error))
+                                })
+                            );
+                        } else {
+                            emit({event: 'api.syncAjax.returned_non_promise', callId, method, url, result: safeClone(result)});
+                        }
+                        return result;
+                    };
+                    emit({event: 'api.syncAjax.wrapped'});
+                };
+                const wrapVm = (vm, reason) => {
+                    if (!vm || typeof vm.getSchList !== 'function' || vm.__chsiGetSchListWrapped) return false;
+                    const originalGetSchList = vm.getSchList;
+                    vm.__chsiGetSchListWrapped = true;
+                    vm.getSchList = function() {
+                        const callId = ++window.__chsiGetSchListSeq;
+                        const postdata = calcPostdata(this);
+                        emit({
+                            event: 'getSchList.call',
+                            callId,
+                            reason,
+                            postdata,
+                            stateBefore: vueState(this),
+                            stack: (new Error()).stack
+                        });
+                        installApiWrapper(window.api);
+                        window.__chsiCurrentGetSchListCallId = callId;
+                        try {
+                            return originalGetSchList.apply(this, arguments);
+                        } finally {
+                            window.__chsiCurrentGetSchListCallId = null;
+                            setTimeout(() => emit({event: 'getSchList.state_after_0ms', callId, state: vueState(this)}), 0);
+                            setTimeout(() => emit({event: 'getSchList.state_after_1000ms', callId, state: vueState(this), listSample: Array.isArray(this.list) ? safeClone(this.list.slice(0, 3)) : []}), 1000);
+                            setTimeout(() => emit({event: 'getSchList.state_after_5000ms', callId, state: vueState(this), listSample: Array.isArray(this.list) ? safeClone(this.list.slice(0, 3)) : []}), 5000);
+                        }
+                    };
+                    emit({event: 'getSchList.wrapped', reason, state: vueState(vm)});
+                    return true;
+                };
+                const installVueMixin = (Vue) => {
+                    if (!Vue || typeof Vue.mixin !== 'function' || Vue.__chsiGetSchListMixinInstalled) return;
+                    Vue.__chsiGetSchListMixinInstalled = true;
+                    Vue.mixin({
+                        created: function() {
+                            try {
+                                const isRootApp = this.$options && (this.$options.el === '#app' || this.$options.el === document.querySelector('#app'));
+                                if (isRootApp || typeof this.getSchList === 'function') {
+                                    wrapVm(this, 'vue_global_mixin_created');
+                                }
+                            } catch (error) {
+                                emit({event: 'getSchList.wrap_error', error: String(error && (error.stack || error.message || error))});
+                            }
+                        }
+                    });
+                    emit({event: 'vue.mixin.installed'});
+                };
+                const installApiSetter = () => {
+                    if (Object.prototype.hasOwnProperty.call(window, 'api') && window.api) {
+                        installApiWrapper(window.api);
+                        return;
+                    }
+                    let apiValue;
+                    try {
+                        Object.defineProperty(window, 'api', {
+                            configurable: true,
+                            get() { return apiValue; },
+                            set(value) {
+                                apiValue = value;
+                                installApiWrapper(value);
+                            }
+                        });
+                    } catch (error) {
+                        emit({event: 'api.setter.install_error', error: String(error)});
+                    }
+                };
+                installApiSetter();
+                if (window.Vue) {
+                    installVueMixin(window.Vue);
+                } else {
+                    let vueValue;
+                    try {
+                        Object.defineProperty(window, 'Vue', {
+                            configurable: true,
+                            get() { return vueValue; },
+                            set(value) {
+                                vueValue = value;
+                                installVueMixin(value);
+                                Object.defineProperty(window, 'Vue', {value, writable: true, configurable: true});
+                            }
+                        });
+                    } catch (error) {
+                        emit({event: 'vue.setter.install_error', error: String(error)});
+                    }
+                }
+                emit({event: 'probe.installed'});
+            })();
+            """
+        )
+
     # 监听 warmup 期间的关键请求、响应、失败请求、console、页面异常和原生 dialog。
     def attach_schsearch_debug_listeners(self, page: Page) -> None:
         if self.schsearch_debug_attached:
@@ -353,16 +530,21 @@ class ChsiSchoolCrawler:
 
         def record_console(message: Any) -> None:
             text = message.text
-            if message.type not in {"error", "warning"} and not any(keyword in text for keyword in ["服务异常", "schsearch", "error", "Error"]):
+            if message.type not in {"error", "warning"} and not any(keyword in text for keyword in ["服务异常", "schsearch", "getSchList", "chsi-getSchList", "error", "Error"]):
                 return
-            self.append_warmup_debug_event(
-                {
-                    "event": "console",
-                    "type": message.type,
-                    "text": text[:2000],
-                    "location": message.location,
-                }
-            )
+            event = {
+                "event": "console",
+                "type": message.type,
+                "text": text[:2000],
+                "location": message.location,
+            }
+            if text.startswith("[chsi-getSchList] "):
+                event["event"] = "getSchList.console"
+                try:
+                    event["payload"] = json.loads(text.replace("[chsi-getSchList] ", "", 1))
+                except Exception:
+                    pass
+            self.append_warmup_debug_event(event)
             logger.info("页面 console：type=%s text=%s", message.type, text[:300])
 
         def record_page_error(error: Exception) -> None:
@@ -424,7 +606,8 @@ class ChsiSchoolCrawler:
                         xlcc: vm.xlcc || '',
                         zgsx: Array.isArray(vm.zgsx) ? vm.zgsx : []
                     } : {hasVm: false},
-                    resources
+                    resources,
+                    getSchListEvents: Array.isArray(window.__chsiGetSchListEvents) ? window.__chsiGetSchListEvents : []
                 };
             }
             """
@@ -450,11 +633,20 @@ class ChsiSchoolCrawler:
     # 根据页面状态和 schsearch 响应粗略推断失败原因，方便从日志快速定位。
     def infer_warmup_failure_cause(self, snapshot: dict[str, Any]) -> str:
         dialog_text = " ".join(snapshot.get("dialogText") or [])
+        get_schlist_events = snapshot.get("getSchListEvents") or []
+        get_schlist_calls = [event for event in get_schlist_events if event.get("event") == "getSchList.call"]
+        get_schlist_api_results = [event for event in get_schlist_events if event.get("event") in {"api.syncAjax.resolved", "api.syncAjax.rejected"}]
         schsearch_events = [event for event in self.warmup_debug_events if "/wap/sch/schsearch" in str(event.get("url", ""))]
         failed_events = [event for event in schsearch_events if event.get("event") in {"response", "requestfailed"} and (event.get("status", 200) >= 400 or event.get("failure") or "服务异常" in str(event.get("body_preview", "")))]
         if "服务异常" in dialog_text and failed_events:
             latest = failed_events[-1]
-            return f"/wap/sch/schsearch 请求失败或返回服务异常；status={latest.get('status')} failure={latest.get('failure')}，详情见 diagnostics events。"
+            return f"this.getSchList 已触发 {len(get_schlist_calls)} 次；/wap/sch/schsearch 请求失败或返回服务异常；status={latest.get('status')} failure={latest.get('failure')}，详情见 diagnostics events 和 snapshot.getSchListEvents。"
+        if get_schlist_calls and get_schlist_api_results:
+            latest_result = get_schlist_api_results[-1]
+            response = latest_result.get("response") or latest_result.get("error")
+            return f"this.getSchList 已触发 {len(get_schlist_calls)} 次；最近一次 api.syncAjax 结果={str(response)[:300]}。"
+        if not get_schlist_calls:
+            return "未捕获到 this.getSchList 自动触发；请查看 snapshot.getSchListEvents 中是否只有 probe/vue.mixin 安装事件，可能是 Vue 探针未在页面脚本前注入或页面脚本未正常执行。"
         if "服务异常" in dialog_text:
             return "页面已出现 Vant 服务异常弹窗，但未捕获到 schsearch 响应；可能是监听注册过晚、请求被浏览器/扩展拦截，或接口在脚本层被封装吞掉。"
         vue_state = snapshot.get("vueState") or {}
@@ -466,7 +658,8 @@ class ChsiSchoolCrawler:
     async def warmup(self, page: Page, context: BrowserContext) -> None:
         # 输出预热开始日志。
         logger.info("开始访问学校列表页：%s", SCHOOL_LIST_URL)
-        # 确保即使单独调用 warmup，也会先注册诊断监听器，再发起导航。
+        # 确保即使单独调用 warmup，也会先注入 getSchList 探针并注册诊断监听器，再发起导航。
+        await self.install_get_schlist_probe(page)
         self.attach_schsearch_debug_listeners(page)
         # 访问列表页，等待 DOMContentLoaded 即可，不强求 networkidle，避免某些统计请求长时间挂起。
         goto_url = SCHOOL_LIST_URL
