@@ -199,7 +199,18 @@ https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}
 - `onclick`、`data-href`、`data-url` 等属性；
 - 页面 HTML / 内联脚本 / JSON 文本中的 `schId` 字段。
 
-翻页时会优先滚动页面，让 Vant `van-list` 自然触发源码里的 `onLoad`；如果懒加载没有触发，也会用同源 WAP `schsearch` 按当前 `startOfNextPage` 补取下一页。程序不会加入桌面端列表 HTML 兜底，以免掩盖 WAP 列表页自身的问题；如果仍未拿到 ID，会保留 `chsi_network_log.json` 和 `chsi_warmup_goto.curl.sh` 供定位。
+翻页时会优先滚动页面，让 Vant `van-list` 自然触发源码里的 `onLoad`；如果懒加载没有触发，也会用同源 WAP `schsearch` 按当前 `startOfNextPage` 补取下一页。程序不会加入桌面端列表 HTML 兜底，以免掩盖 WAP 列表页自身的问题；如果仍未拿到 ID，会保留 `chsi_network_log.json`、`chsi_warmup_goto.curl.sh`、`chsi_warmup_diagnostics.json` 和 `chsi_warmup_page.html` 供定位。
+
+### 如何定位 warmup 时的“服务异常”？
+
+`page.goto` 成功只代表 `schlist` 主文档返回成功；弹窗通常来自页面随后自动发起的 `/wap/sch/schsearch`、`/wap/sch/querycondition` 等 XHR/fetch。程序会在 warmup 导航前注册请求、响应、requestfailed、console、pageerror 和 dialog 监听，并把以下信息写入 `output/chsi_warmup_diagnostics.json`：
+
+- 关键请求/响应的 URL、方法、资源类型、状态码、POST data 和响应正文预览；
+- Vant 弹窗文本、Vue `#app.__vue__` 状态、`listLength/loading/finished/nextPageAvailable/startOfNextPage`；
+- 当前 Cookie 名称和关键 Performance ResourceTiming；
+- `probable_cause` 字段会根据弹窗和 `schsearch` 响应粗略判断原因。
+
+同时会保存 `output/chsi_warmup_page.html` 作为页面现场快照。优先查看 diagnostics 中 `/wap/sch/schsearch` 的 `body_preview`：如果里面是 `flag=false` 或 `服务异常`，说明主文档没问题，失败点是列表接口响应。
 
 ### Cookie 如何持久化？
 

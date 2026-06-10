@@ -59,6 +59,10 @@ COLLEGES_FILE = OUTPUT_DIR / "chsi_colleges.json"
 NETWORK_LOG_FILE = OUTPUT_DIR / "chsi_network_log.json"
 # 列表页导航复现 curl 输出文件。
 WARMUP_CURL_FILE = OUTPUT_DIR / "chsi_warmup_goto.curl.sh"
+# warmup 阶段诊断信息输出文件。
+WARMUP_DIAGNOSTICS_FILE = OUTPUT_DIR / "chsi_warmup_diagnostics.json"
+# warmup 阶段页面 HTML 快照输出文件。
+WARMUP_HTML_FILE = OUTPUT_DIR / "chsi_warmup_page.html"
 # 学校列表页：用于执行 JS 挑战并提取学校 ID。
 SCHOOL_LIST_URL = "https://gaokao.chsi.com.cn/wap/sch/schlist"
 # 院校库详情页：通过学校 ID 获取院校库信息。
@@ -146,8 +150,10 @@ class ChsiSchoolCrawler:
         self.colleges: list[dict[str, Any]] = []
         # 用于保存每次页面访问的调试日志。
         self.network_logs: list[dict[str, Any]] = []
-        # 避免对同一个页面重复注册 schsearch 调试监听器。
+        # 避免对同一个页面重复注册 schsearch / warmup 调试监听器。
         self.schsearch_debug_attached = False
+        # warmup 期间的请求、响应、console、弹窗等诊断事件。
+        self.warmup_debug_events: list[dict[str, Any]] = []
 
     # 判断页面或响应是否像阿里云 / WAF / JS 挑战页。
     def is_challenge_text(self, text: str) -> bool:
@@ -213,52 +219,255 @@ class ChsiSchoolCrawler:
         WARMUP_CURL_FILE.write_text(curl_text, encoding="utf-8")
         logger.info("已写出学校列表页 goto 复现 curl：%s", WARMUP_CURL_FILE)
 
-    # 监听 /wap/sch/schsearch 请求和响应，用日志定位“服务异常”的真实接口状态和响应摘要。
+    # 判断某个请求是否需要纳入 warmup 诊断范围，避免把统计、图片等无关请求刷屏。
+    def is_warmup_debug_request(self, url: str, resource_type: str = "") -> bool:
+        # schlist 主文档、列表接口、筛选条件接口、站点 JS / 风控脚本都和“服务异常”定位相关。
+        important_patterns = [
+            "/wap/sch/schlist",
+            "/wap/sch/schsearch",
+            "/wap/sch/querycondition",
+            "/gaokao/wap/assets/js/app-",
+            ".c69d89a.js",
+        ]
+        if any(pattern in url for pattern in important_patterns):
+            return True
+        # XHR / fetch 失败最可能导致页面弹“服务异常”，统一记录。
+        return resource_type in {"xhr", "fetch"} and ("gaokao.chsi.com.cn" in url or "chei.com.cn" in url)
+
+    # 对敏感请求头做轻量脱敏：保留 Cookie 名称，隐藏具体值。
+    def redact_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        redacted: dict[str, str] = {}
+        for key, value in headers.items():
+            lower_key = key.lower()
+            if lower_key == "cookie":
+                names = []
+                for item in value.split(";"):
+                    name = item.split("=", 1)[0].strip()
+                    if name:
+                        names.append(name)
+                redacted[key] = "; ".join(f"{name}=<redacted>" for name in names)
+            elif lower_key in {"authorization", "proxy-authorization"}:
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = value
+        return redacted
+
+    # 追加 warmup 诊断事件，并限制内存中保存的事件数量。
+    def append_warmup_debug_event(self, event: dict[str, Any]) -> None:
+        event.setdefault("recorded_at", datetime.now().isoformat(timespec="seconds"))
+        self.warmup_debug_events.append(event)
+        # 保留最近 300 条，足够覆盖 schlist 首屏和 schsearch 失败链路。
+        if len(self.warmup_debug_events) > 300:
+            self.warmup_debug_events = self.warmup_debug_events[-300:]
+
+    # 监听 warmup 期间的关键请求、响应、失败请求、console、页面异常和原生 dialog。
     def attach_schsearch_debug_listeners(self, page: Page) -> None:
         if self.schsearch_debug_attached:
             return
         self.schsearch_debug_attached = True
 
+        async def record_request(request: Any) -> None:
+            if not self.is_warmup_debug_request(request.url, request.resource_type):
+                return
+            try:
+                headers = await request.all_headers()
+            except Exception:
+                headers = request.headers
+            post_data = request.post_data or ""
+            self.append_warmup_debug_event(
+                {
+                    "event": "request",
+                    "url": request.url,
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "headers": self.redact_headers(headers),
+                    "post_data": post_data[:2000],
+                }
+            )
+            if "/wap/sch/schsearch" in request.url:
+                logger.info("schsearch 请求：method=%s post_data=%s", request.method, post_data[:500])
+
         async def record_response(response: Any) -> None:
-            if "/wap/sch/schsearch" not in response.url:
+            if not self.is_warmup_debug_request(response.url, response.request.resource_type):
                 return
             request = response.request
             post_data = request.post_data or ""
             body_preview = ""
-            try:
-                body_preview = (await response.text())[:1000]
-            except Exception as exc:
-                body_preview = f"<读取响应正文失败：{exc}>"
-            log_item = {
-                "request": {
+            # 只读取 schsearch 或异常响应正文；避免读取大 JS / HTML 造成额外开销。
+            if "/wap/sch/schsearch" in response.url or response.status >= 400:
+                try:
+                    body_preview = (await response.text())[:2000]
+                except Exception as exc:
+                    body_preview = f"<读取响应正文失败：{exc}>"
+            event = {
+                "event": "response",
+                "url": response.url,
+                "status": response.status,
+                "ok": response.ok,
+                "request_method": request.method,
+                "resource_type": request.resource_type,
+                "post_data": post_data[:2000],
+                "body_preview": body_preview,
+            }
+            self.append_warmup_debug_event(event)
+            if "/wap/sch/schsearch" in response.url:
+                log_item = {
+                    "request": {
+                        "url": request.url,
+                        "method": request.method,
+                        "post_data": post_data[:1000],
+                        "mode": "schsearch_auto_by_page",
+                    },
+                    "response": {
+                        "status": response.status,
+                        "url": response.url,
+                        "ok": response.ok,
+                        "body_preview": body_preview,
+                    },
+                    "recorded_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                self.network_logs.append(log_item)
+                logger.warning(
+                    "schsearch 响应：status=%s ok=%s post_data=%s body_preview=%s",
+                    response.status,
+                    response.ok,
+                    post_data[:300],
+                    body_preview[:300].replace("\n", " "),
+                )
+
+        def record_request_failed(request: Any) -> None:
+            if not self.is_warmup_debug_request(request.url, request.resource_type):
+                return
+            failure = request.failure or ""
+            self.append_warmup_debug_event(
+                {
+                    "event": "requestfailed",
                     "url": request.url,
                     "method": request.method,
-                    "post_data": post_data[:1000],
-                    "mode": "schsearch_auto_by_page",
-                },
-                "response": {
-                    "status": response.status,
-                    "url": response.url,
-                    "ok": response.ok,
-                    "body_preview": body_preview,
-                },
-                "recorded_at": datetime.now().isoformat(timespec="seconds"),
-            }
-            self.network_logs.append(log_item)
-            logger.warning(
-                "schsearch 响应：status=%s ok=%s post_data=%s body_preview=%s",
-                response.status,
-                response.ok,
-                post_data[:300],
-                body_preview[:300].replace("\n", " "),
+                    "resource_type": request.resource_type,
+                    "failure": failure,
+                    "post_data": (request.post_data or "")[:2000],
+                }
             )
+            logger.warning("warmup 请求失败：method=%s url=%s failure=%s", request.method, request.url, failure)
 
+        def record_console(message: Any) -> None:
+            text = message.text
+            if message.type not in {"error", "warning"} and not any(keyword in text for keyword in ["服务异常", "schsearch", "error", "Error"]):
+                return
+            self.append_warmup_debug_event(
+                {
+                    "event": "console",
+                    "type": message.type,
+                    "text": text[:2000],
+                    "location": message.location,
+                }
+            )
+            logger.info("页面 console：type=%s text=%s", message.type, text[:300])
+
+        def record_page_error(error: Exception) -> None:
+            self.append_warmup_debug_event({"event": "pageerror", "message": str(error)[:2000]})
+            logger.warning("页面 JS 异常：%s", error)
+
+        async def record_dialog(dialog: Any) -> None:
+            self.append_warmup_debug_event({"event": "native_dialog", "type": dialog.type, "message": dialog.message})
+            logger.warning("页面原生 dialog：type=%s message=%s", dialog.type, dialog.message)
+            await dialog.dismiss()
+
+        page.on("request", lambda request: asyncio.create_task(record_request(request)))
         page.on("response", lambda response: asyncio.create_task(record_response(response)))
+        page.on("requestfailed", record_request_failed)
+        page.on("console", record_console)
+        page.on("pageerror", record_page_error)
+        page.on("dialog", lambda dialog: asyncio.create_task(record_dialog(dialog)))
+
+    # 保存 warmup 现场快照：Vue 状态、弹窗文本、Cookie 名称、关键网络事件、HTML。
+    async def save_warmup_diagnostics(self, page: Page, context: BrowserContext, stage: str) -> None:
+        snapshot = await page.evaluate(
+            """
+            () => {
+                const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                const app = document.querySelector('#app');
+                const vm = app && app.__vue__;
+                const dialogText = Array.from(document.querySelectorAll('.van-dialog, .van-toast, [role="dialog"]'))
+                    .map((node) => clean(node.innerText || node.textContent || ''))
+                    .filter(Boolean);
+                const importantResourcePattern = new RegExp('/wap/sch/schsearch|/wap/sch/querycondition|/wap/sch/schlist|app-2[.]0[.]7|c69d89a');
+                const resources = performance.getEntriesByType('resource')
+                    .filter((item) => importantResourcePattern.test(item.name))
+                    .map((item) => ({
+                        name: item.name,
+                        initiatorType: item.initiatorType,
+                        startTime: Math.round(item.startTime),
+                        duration: Math.round(item.duration),
+                        transferSize: item.transferSize || 0,
+                        encodedBodySize: item.encodedBodySize || 0,
+                        decodedBodySize: item.decodedBodySize || 0
+                    }));
+                return {
+                    url: location.href,
+                    title: document.title,
+                    readyState: document.readyState,
+                    bodyTextPreview: clean(document.body ? document.body.innerText : '').slice(0, 1000),
+                    dialogText,
+                    vueState: vm ? {
+                        hasVm: true,
+                        listLength: Array.isArray(vm.list) ? vm.list.length : 0,
+                        loading: Boolean(vm.loading),
+                        finished: Boolean(vm.finished),
+                        error: Boolean(vm.error),
+                        nextPageAvailable: Boolean(vm.nextPageAvailable),
+                        startOfNextPage: vm.startOfNextPage,
+                        yxmc: vm.yxmc || '',
+                        ssdm: vm.ssdm || '',
+                        yxls: vm.yxls || '',
+                        xlcc: vm.xlcc || '',
+                        zgsx: Array.isArray(vm.zgsx) ? vm.zgsx : []
+                    } : {hasVm: false},
+                    resources
+                };
+            }
+            """
+        )
+        cookies = await context.cookies(SCHOOL_LIST_URL)
+        cookie_summary = sorted(cookie.get("name", "") for cookie in cookies)
+        diagnostics = {
+            "stage": stage,
+            "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            "snapshot": snapshot,
+            "cookie_names": cookie_summary,
+            "events": self.warmup_debug_events,
+            "probable_cause": self.infer_warmup_failure_cause(snapshot),
+        }
+        WARMUP_DIAGNOSTICS_FILE.write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            html = await page.content()
+            WARMUP_HTML_FILE.write_text(html, encoding="utf-8")
+        except Exception as exc:
+            logger.warning("写出 warmup HTML 快照失败：%s", exc)
+        logger.info("已保存 warmup 诊断：%s html=%s cause=%s", WARMUP_DIAGNOSTICS_FILE, WARMUP_HTML_FILE, diagnostics["probable_cause"])
+
+    # 根据页面状态和 schsearch 响应粗略推断失败原因，方便从日志快速定位。
+    def infer_warmup_failure_cause(self, snapshot: dict[str, Any]) -> str:
+        dialog_text = " ".join(snapshot.get("dialogText") or [])
+        schsearch_events = [event for event in self.warmup_debug_events if "/wap/sch/schsearch" in str(event.get("url", ""))]
+        failed_events = [event for event in schsearch_events if event.get("event") in {"response", "requestfailed"} and (event.get("status", 200) >= 400 or event.get("failure") or "服务异常" in str(event.get("body_preview", "")))]
+        if "服务异常" in dialog_text and failed_events:
+            latest = failed_events[-1]
+            return f"/wap/sch/schsearch 请求失败或返回服务异常；status={latest.get('status')} failure={latest.get('failure')}，详情见 diagnostics events。"
+        if "服务异常" in dialog_text:
+            return "页面已出现 Vant 服务异常弹窗，但未捕获到 schsearch 响应；可能是监听注册过晚、请求被浏览器/扩展拦截，或接口在脚本层被封装吞掉。"
+        vue_state = snapshot.get("vueState") or {}
+        if vue_state.get("hasVm") and vue_state.get("listLength") == 0 and not vue_state.get("loading"):
+            return "Vue 实例存在但 list 为空且未加载中；需要查看 schsearch 响应 body_preview 判断接口返回 flag=false、空列表还是非 JSON。"
+        return "未发现明确服务异常；请查看 diagnostics events 中的 request/response/console/pageerror。"
 
     # 访问列表页，等待 JS 挑战自动完成并写入 Cookie。
     async def warmup(self, page: Page, context: BrowserContext) -> None:
         # 输出预热开始日志。
         logger.info("开始访问学校列表页：%s", SCHOOL_LIST_URL)
+        # 确保即使单独调用 warmup，也会先注册诊断监听器，再发起导航。
+        self.attach_schsearch_debug_listeners(page)
         # 访问列表页，等待 DOMContentLoaded 即可，不强求 networkidle，避免某些统计请求长时间挂起。
         goto_url = SCHOOL_LIST_URL
         goto_wait_until = "domcontentloaded"
@@ -285,6 +494,8 @@ class ChsiSchoolCrawler:
             logger.warning("学校列表页等待 networkidle 超时，继续后续流程")
         # 额外等待 2 秒，给阿里云 JS 挑战和列表接口写 Cookie / 渲染 DOM 的时间。
         await page.wait_for_timeout(2_000)
+        # 保存 warmup 现场，用于定位“服务异常”到底来自哪个请求/响应。
+        await self.save_warmup_diagnostics(page, context, "warmup_after_networkidle")
         # 打印 Cookie 概况，用于判断挑战是否完成。
         await self.log_cookie_summary(context)
         # 保存当前 storage_state，后续启动可复用 Cookie。
@@ -389,6 +600,7 @@ class ChsiSchoolCrawler:
                 return True
             if dialog:
                 logger.warning("schlist 页面出现弹窗，停止等待当前 WAP 列表：%s", dialog.replace("\n", " | "))
+                await self.save_warmup_diagnostics(page, page.context, "vue_dialog_detected")
                 await self.close_page_dialog_if_present(page)
                 return False
             if state.get("hasVm") and not state.get("loading") and state.get("finished"):
