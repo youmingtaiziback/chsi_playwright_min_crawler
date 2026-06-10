@@ -174,7 +174,7 @@ START=10 python crawler.py
 
 ## 原理说明
 
-### 为什么不再调用 schsearch？
+### 为什么不主动调用 schsearch？
 
 `schsearch?start=...` 在部分环境下会被风控重写为随机参数 URL，并返回 `400 Bad Request` 或空 HTML。当前策略改为先从 WAP 列表页：
 
@@ -188,18 +188,18 @@ https://gaokao.chsi.com.cn/wap/sch/schlist
 https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}
 ```
 
-这样每个详情页都由真实 Chromium 以页面导航方式打开，能执行详情页上的 JS 和可能出现的挑战脚本，同时避免依赖容易被拦截的 `schsearch` JSON 接口。
+这样每个详情页都由真实 Chromium 以页面导航方式打开，能执行详情页上的 JS 和可能出现的挑战脚本。WAP 页面自身的 `mounted/getSchList` 仍可能自动请求 `/wap/sch/schsearch`，但程序不再额外主动重复调用它；一旦该接口弹出“服务异常”，会关闭弹窗并切换到桌面端列表 HTML 兜底。
 
 ### 如何从 schlist 获取学校 ID？
 
-程序会访问 `schlist`，等待 DOMContentLoaded、networkidle 和额外渲染时间，然后按 `schlist.html` 源码中的 Vue 逻辑等待或主动触发 `getSchList()`，由页面自己请求 `/wap/sch/schsearch` 并把结果写入 `#app.__vue__.list`。每轮都会从以下位置提取 ID：
+程序会访问 `schlist`，等待 DOMContentLoaded、networkidle 和额外渲染时间，然后观察 `schlist.html` 源码中 `mounted` 自动触发的 `getSchList()` 是否把结果写入 `#app.__vue__.list`。程序不会再额外主动调用 `getSchList()`，避免在 `/wap/sch/schsearch` 异常时重复弹出“服务异常”。每轮都会从以下位置提取 ID：
 
 - Vue 实例 `#app.__vue__.list` 中的 `item.schId` 字段（优先来源）；
 - `a[href]`、`url` 中的 `/wap/sch/schinfomain/{id}`、`/wap/sch/schinfo/{id}` 等链接；
 - `onclick`、`data-href`、`data-url` 等属性；
 - 页面 HTML / 内联脚本 / JSON 文本中的 `schId` 字段。
 
-翻页时会优先复用源码里的 `nextPageAvailable` 和 `getSchList()`，再滚动页面兜底触发移动端懒加载。
+翻页时会优先滚动页面，让 Vant `van-list` 自然触发源码里的 `onLoad`；如果 WAP 页出现“服务异常”或没有拿到足够 ID，会改用桌面端院校库列表 HTML（`/sch/search--ss-on,option-qg,searchType-1,start-*.dhtml`）作为兜底来源，并从其中的 `schoolInfo--schId-{id}` 链接提取学校 ID。
 
 ### Cookie 如何持久化？
 

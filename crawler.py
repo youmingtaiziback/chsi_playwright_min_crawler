@@ -59,6 +59,8 @@ NETWORK_LOG_FILE = OUTPUT_DIR / "chsi_network_log.json"
 SCHOOL_LIST_URL = "https://gaokao.chsi.com.cn/wap/sch/schlist"
 # 院校库详情页：通过学校 ID 获取院校库信息。
 SCHOOL_INFO_URL = "https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}"
+# 桌面端院校库列表页兜底地址：用于 WAP schlist 的 /wap/sch/schsearch 异常时从 HTML 链接提取 schId。
+SCHOOL_DESKTOP_LIST_URL = "https://gaokao.chsi.com.cn/sch/search--ss-on,option-qg,searchType-1,start-{start}.dhtml"
 # 兼容旧命名：列表页同样承担预热 Cookie 与执行 JS 挑战的职责。
 WARMUP_URL = SCHOOL_LIST_URL
 
@@ -232,6 +234,10 @@ class ChsiSchoolCrawler:
         patterns = [
             r"/wap/sch/(?:schinfomain|schinfo|schdetail)/(\d+)",
             r"schinfomain/(\d+)",
+            # 桌面端院校库 HTML 常见链接：/sch/schoolInfo--schId-799%2CcategoryId-...dhtml。
+            r"schoolInfo(?:Main)?--schId-(\d+)",
+            # 部分页面/脚本使用查询参数形式传递 schId。
+            r"[?&,]schId=(\d+)",
             # schlist.html 源码中列表数据字段为 item.schId；接口 JSON 常见形式为 "schId": 123。
             r"[\"']?schId[\"']?\s*[:=]\s*[\"']?(\d+)",
         ]
@@ -274,74 +280,61 @@ class ChsiSchoolCrawler:
         # 返回保持原始顺序的学校 ID。
         return ids
 
-    # 等待 schlist 源码中的 Vue 列表数据就绪；必要时触发页面自身的 getSchList。
+    # 等待 schlist 源码中 mounted 自动触发的 Vue 列表请求结束。
     async def wait_for_schlist_vue_data(self, page: Page) -> None:
-        # 这里不是在 Python/Playwright 中重写 getSchList；只是调用 schlist.html 已挂到 Vue 实例上的原函数。
-        # getSchList 内部异步请求 /wap/sch/schsearch，但函数本身不返回 Promise，因此调用后还要等待 Vue 状态变化。
-        for attempt in range(1, 6):
+        # schlist.html 在 mounted 中已经会调用 this.getSchList()；这里不要再次主动调用，避免重复触发
+        # /wap/sch/schsearch 并弹出“服务异常”对话框。这里只观察 Vue 状态，必要时关闭错误弹窗后走兜底列表。
+        for attempt in range(1, 8):
             state = await page.evaluate(
                 """
                 () => {
                     const app = document.querySelector('#app');
                     const vm = app && app.__vue__;
+                    const dialog = Array.from(document.querySelectorAll('.van-dialog, [role="dialog"]'))
+                        .map((node) => (node.innerText || node.textContent || '').trim())
+                        .find(Boolean) || '';
                     if (!vm) {
-                        return {hasVm: false, triggered: false, listLength: 0, loading: false, nextPageAvailable: false};
-                    }
-                    const listLength = Array.isArray(vm.list) ? vm.list.length : 0;
-                    if (listLength > 0) {
-                        return {
-                            hasVm: true,
-                            triggered: false,
-                            listLength,
-                            loading: Boolean(vm.loading),
-                            nextPageAvailable: Boolean(vm.nextPageAvailable),
-                            startOfNextPage: vm.startOfNextPage
-                        };
-                    }
-                    if (typeof vm.getSchList === 'function' && !vm.loading) {
-                        vm.getSchList();
-                        return {
-                            hasVm: true,
-                            triggered: true,
-                            listLength,
-                            loading: Boolean(vm.loading),
-                            nextPageAvailable: Boolean(vm.nextPageAvailable),
-                            startOfNextPage: vm.startOfNextPage
-                        };
+                        return {hasVm: false, listLength: 0, loading: false, nextPageAvailable: false, dialog};
                     }
                     return {
                         hasVm: true,
-                        triggered: false,
-                        listLength,
+                        listLength: Array.isArray(vm.list) ? vm.list.length : 0,
                         loading: Boolean(vm.loading),
                         nextPageAvailable: Boolean(vm.nextPageAvailable),
-                        startOfNextPage: vm.startOfNextPage
+                        finished: Boolean(vm.finished),
+                        startOfNextPage: vm.startOfNextPage,
+                        dialog
                     };
                 }
                 """
             )
+            dialog = str(state.get("dialog") or "")
             if state.get("listLength", 0) > 0:
                 logger.info("schlist Vue 列表数据已就绪：%s", state)
                 return
-            if state.get("triggered"):
-                try:
-                    await page.wait_for_function(
-                        """
-                        () => {
-                            const app = document.querySelector('#app');
-                            const vm = app && app.__vue__;
-                            return Boolean(vm && Array.isArray(vm.list) && vm.list.length > 0 && !vm.loading);
-                        }
-                        """,
-                        timeout=5_000,
-                    )
-                    logger.info("schlist getSchList 首屏请求完成：attempt=%s", attempt)
-                    return
-                except PlaywrightTimeoutError:
-                    logger.warning("等待 schlist getSchList 首屏请求完成超时：attempt=%s state=%s", attempt, state)
-            else:
-                logger.info("等待 schlist Vue 列表数据：attempt=%s state=%s", attempt, state)
-                await page.wait_for_timeout(1_000)
+            if dialog:
+                logger.warning("schlist 页面出现弹窗，停止等待 WAP 列表并准备兜底：%s", dialog.replace("\n", " | "))
+                await self.close_page_dialog_if_present(page)
+                return
+            if state.get("hasVm") and not state.get("loading") and state.get("finished"):
+                logger.warning("schlist Vue 列表请求已结束但没有数据，准备兜底：%s", state)
+                return
+            logger.info("等待 schlist mounted 列表请求：attempt=%s state=%s", attempt, state)
+            await page.wait_for_timeout(1_000)
+
+    # 如果页面出现 Vant/浏览器弹窗，尝试点击确认关闭，避免遮挡后续页面操作。
+    async def close_page_dialog_if_present(self, page: Page) -> bool:
+        return await page.evaluate(
+            """
+            () => {
+                const candidates = Array.from(document.querySelectorAll('.van-dialog__confirm, .van-button, button'));
+                const button = candidates.find((node) => /确定|确认|关闭|OK/i.test((node.innerText || node.textContent || '').trim()));
+                if (!button) return false;
+                button.click();
+                return true;
+            }
+            """
+        )
 
     # 读取当前列表页 DOM、Vue 实例和页面源码，并提取学校 ID。
     async def extract_school_ids_from_page(self, page: Page) -> list[str]:
@@ -424,56 +417,78 @@ class ChsiSchoolCrawler:
         )
 
 
-    # 根据 schlist.html 中的 onLoad 逻辑，调用页面自身的 Vue getSchList 加载下一页。
-    async def trigger_schlist_next_page(self, page: Page) -> bool:
-        # Vant van-list 滚动到底后实际执行 onLoad；onLoad 在 nextPageAvailable 为 true 时调用 getSchList。
-        # 这里同样不是重写 getSchList，而是触发页面已有方法，并等待 list 追加或翻页结束。
-        state = await page.evaluate(
-            """
-            () => {
-                const app = document.querySelector('#app');
-                const vm = app && app.__vue__;
-                if (!vm || typeof vm.getSchList !== 'function') {
-                    return {triggered: false, reason: 'no-vue-getSchList'};
-                }
-                const listLength = Array.isArray(vm.list) ? vm.list.length : 0;
-                if (vm.loading) {
-                    return {triggered: false, reason: 'loading', listLength, startOfNextPage: vm.startOfNextPage};
-                }
-                if (!vm.nextPageAvailable) {
-                    return {triggered: false, reason: 'no-next-page', listLength, startOfNextPage: vm.startOfNextPage};
-                }
-                vm.getSchList();
-                return {triggered: true, listLength, startOfNextPage: vm.startOfNextPage};
-            }
-            """
-        )
-        logger.info("触发 schlist 下一页状态：%s", state)
-        if not state.get("triggered"):
-            return False
+    # 等待滚动后由 Vant van-list/onLoad 自然触发的下一页请求。
+    async def wait_for_schlist_lazy_page(self, page: Page, previous_length: int) -> bool:
+        # 不主动调用 vm.getSchList()，避免在 schsearch 已异常时不断弹出“服务异常”。
+        # 只在滚动后观察 list 是否增长，或页面是否明确没有下一页。
         try:
             await page.wait_for_function(
                 """
                 (previousLength) => {
                     const app = document.querySelector('#app');
                     const vm = app && app.__vue__;
-                    if (!vm || vm.loading) return false;
+                    if (!vm) return false;
                     const listLength = Array.isArray(vm.list) ? vm.list.length : 0;
-                    return listLength > previousLength || !vm.nextPageAvailable;
+                    const dialog = Array.from(document.querySelectorAll('.van-dialog, [role="dialog"]'))
+                        .map((node) => (node.innerText || node.textContent || '').trim())
+                        .find(Boolean) || '';
+                    return listLength > previousLength || (!vm.loading && !vm.nextPageAvailable) || Boolean(dialog);
                 }
                 """,
-                arg=state.get("listLength", 0),
-                timeout=8_000,
+                arg=previous_length,
+                timeout=5_000,
             )
         except PlaywrightTimeoutError:
-            logger.warning("等待 schlist 下一页 getSchList 完成超时：state=%s", state)
+            logger.info("等待 schlist 懒加载下一页超时：previous_length=%s", previous_length)
+            return False
+        dialog_closed = await self.close_page_dialog_if_present(page)
+        if dialog_closed:
+            logger.warning("schlist 懒加载出现服务异常弹窗，已关闭并停止主动加载 WAP 列表")
+            return False
         return True
+
+    # 从桌面端院校库列表 HTML 兜底提取学校 ID，避免 WAP schsearch 异常导致完全无 ID。
+    async def collect_school_ids_from_desktop_pages(self, page: Page, seen: set[str]) -> list[str]:
+        fallback_ids: list[str] = []
+        # 桌面端列表使用 start 偏移；每页通常 20 条。这里复用 list_scroll_rounds 限制兜底页数。
+        for page_index in range(self.list_scroll_rounds):
+            start = page_index * 20
+            url = SCHOOL_DESKTOP_LIST_URL.format(start=start)
+            logger.info("WAP 列表无可用数据，尝试桌面端院校库列表兜底：url=%s", url)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+            except PlaywrightTimeoutError:
+                logger.info("桌面端院校库列表等待 networkidle 超时，继续解析：url=%s", url)
+            await page.wait_for_timeout(500)
+            html = await page.evaluate("() => document.documentElement.outerHTML")
+            current_ids = self.extract_school_ids_from_text(html)
+            added = 0
+            for school_id in current_ids:
+                if school_id not in seen:
+                    fallback_ids.append(school_id)
+                    seen.add(school_id)
+                    added += 1
+            if response:
+                self.network_logs.append(
+                    {
+                        "request": {"url": url, "method": "GET", "mode": "desktop_list_fallback"},
+                        "response": {"status": response.status, "url": response.url, "ok": response.ok},
+                        "recorded_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                )
+            logger.info("桌面端院校库列表兜底进度：page=%s added=%s total_added=%s", page_index + 1, added, len(fallback_ids))
+            if self.max_schools > 0 and len(seen) >= self.start + self.max_schools:
+                break
+            if added == 0:
+                break
+        return fallback_ids
 
     # 从 schlist 列表页获取学校 ID。
     async def collect_school_ids(self, page: Page, context: BrowserContext) -> list[str]:
         # 先访问列表页并执行挑战。
         await self.warmup(page, context)
-        # schlist.html 通过 Vue getSchList 请求 /wap/sch/schsearch 后把结果放入 list，先等待或主动触发一次。
+        # schlist.html 的 mounted 会自动触发 getSchList；这里只等待结果，不再主动重复调用 schsearch。
         await self.wait_for_schlist_vue_data(page)
         # 使用列表保持顺序，使用集合去重。
         school_ids: list[str] = []
@@ -497,19 +512,28 @@ class ChsiSchoolCrawler:
             if self.max_schools > 0 and len(school_ids) >= self.start + self.max_schools:
                 logger.info("已提取到 START + MAX_SCHOOLS 所需数量，停止滚动列表页")
                 break
-            # 按 schlist.html 的真实 onLoad/getSchList 逻辑主动加载下一页，再滚动兜底触发 Vant 懒加载。
-            triggered_next_page = await self.trigger_schlist_next_page(page)
+            # 先滚动到底部，让 Vant van-list 自然触发 onLoad；不主动调用 getSchList，避免重复弹“服务异常”。
+            previous_length = len(current_ids)
             clicked = await self.click_load_more_if_present(page)
             await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1_500)
-            # 如果连续 3 轮既没有新增 ID，也没有主动触发下一页/可点击加载更多，则认为列表已到底。
-            if added == 0 and not clicked and not triggered_next_page:
+            loaded_next_page = await self.wait_for_schlist_lazy_page(page, previous_length)
+            await page.wait_for_timeout(500)
+            # 如果连续 3 轮既没有新增 ID，也没有可点击/懒加载更多，则认为 WAP 列表已到底或不可用。
+            if added == 0 and not clicked and not loaded_next_page:
                 stale_rounds += 1
                 if stale_rounds >= 3:
                     logger.info("列表页连续 %s 轮没有新增学校 ID，停止滚动", stale_rounds)
                     break
             else:
                 stale_rounds = 0
+        # 如果 WAP 列表因为“服务异常”等原因没有拿够 ID，则用桌面端院校库列表 HTML 兜底。
+        required_count = self.start + self.max_schools if self.max_schools > 0 else 1
+        if len(school_ids) < required_count:
+            fallback_ids = await self.collect_school_ids_from_desktop_pages(page, seen)
+            school_ids.extend(fallback_ids)
+            if fallback_ids:
+                logger.info("桌面端兜底补充学校 ID：added=%s total_ids=%s", len(fallback_ids), len(school_ids))
+
         # 如果 START 不为 0，则跳过前面的学校 ID，方便断点续跑。
         selected_ids = school_ids[self.start :]
         # 如果限制了最大学校数量，则截断。
