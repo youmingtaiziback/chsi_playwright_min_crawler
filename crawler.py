@@ -274,24 +274,45 @@ class ChsiSchoolCrawler:
         # 返回保持原始顺序的学校 ID。
         return ids
 
-    # 等待 schlist 源码中的 Vue 列表数据就绪；必要时主动调用 getSchList 触发 /wap/sch/schsearch。
+    # 等待 schlist 源码中的 Vue 列表数据就绪；必要时触发页面自身的 getSchList。
     async def wait_for_schlist_vue_data(self, page: Page) -> None:
-        # schlist.html 的 #app Vue 实例以 list 保存接口返回列表，getSchList 会请求 /wap/sch/schsearch。
+        # 这里不是在 Python/Playwright 中重写 getSchList；只是调用 schlist.html 已挂到 Vue 实例上的原函数。
+        # getSchList 内部异步请求 /wap/sch/schsearch，但函数本身不返回 Promise，因此调用后还要等待 Vue 状态变化。
         for attempt in range(1, 6):
             state = await page.evaluate(
                 """
-                async () => {
+                () => {
                     const app = document.querySelector('#app');
                     const vm = app && app.__vue__;
                     if (!vm) {
-                        return {hasVm: false, listLength: 0, loading: false, nextPageAvailable: false};
+                        return {hasVm: false, triggered: false, listLength: 0, loading: false, nextPageAvailable: false};
                     }
-                    if ((!Array.isArray(vm.list) || vm.list.length === 0) && typeof vm.getSchList === 'function' && !vm.loading) {
+                    const listLength = Array.isArray(vm.list) ? vm.list.length : 0;
+                    if (listLength > 0) {
+                        return {
+                            hasVm: true,
+                            triggered: false,
+                            listLength,
+                            loading: Boolean(vm.loading),
+                            nextPageAvailable: Boolean(vm.nextPageAvailable),
+                            startOfNextPage: vm.startOfNextPage
+                        };
+                    }
+                    if (typeof vm.getSchList === 'function' && !vm.loading) {
                         vm.getSchList();
+                        return {
+                            hasVm: true,
+                            triggered: true,
+                            listLength,
+                            loading: Boolean(vm.loading),
+                            nextPageAvailable: Boolean(vm.nextPageAvailable),
+                            startOfNextPage: vm.startOfNextPage
+                        };
                     }
                     return {
                         hasVm: true,
-                        listLength: Array.isArray(vm.list) ? vm.list.length : 0,
+                        triggered: false,
+                        listLength,
                         loading: Boolean(vm.loading),
                         nextPageAvailable: Boolean(vm.nextPageAvailable),
                         startOfNextPage: vm.startOfNextPage
@@ -302,8 +323,25 @@ class ChsiSchoolCrawler:
             if state.get("listLength", 0) > 0:
                 logger.info("schlist Vue 列表数据已就绪：%s", state)
                 return
-            logger.info("等待 schlist Vue 列表数据：attempt=%s state=%s", attempt, state)
-            await page.wait_for_timeout(1_000)
+            if state.get("triggered"):
+                try:
+                    await page.wait_for_function(
+                        """
+                        () => {
+                            const app = document.querySelector('#app');
+                            const vm = app && app.__vue__;
+                            return Boolean(vm && Array.isArray(vm.list) && vm.list.length > 0 && !vm.loading);
+                        }
+                        """,
+                        timeout=5_000,
+                    )
+                    logger.info("schlist getSchList 首屏请求完成：attempt=%s", attempt)
+                    return
+                except PlaywrightTimeoutError:
+                    logger.warning("等待 schlist getSchList 首屏请求完成超时：attempt=%s state=%s", attempt, state)
+            else:
+                logger.info("等待 schlist Vue 列表数据：attempt=%s state=%s", attempt, state)
+                await page.wait_for_timeout(1_000)
 
     # 读取当前列表页 DOM、Vue 实例和页面源码，并提取学校 ID。
     async def extract_school_ids_from_page(self, page: Page) -> list[str]:
@@ -386,9 +424,10 @@ class ChsiSchoolCrawler:
         )
 
 
-    # 根据 schlist.html 中的 onLoad 逻辑，直接调用 Vue getSchList 加载下一页。
+    # 根据 schlist.html 中的 onLoad 逻辑，调用页面自身的 Vue getSchList 加载下一页。
     async def trigger_schlist_next_page(self, page: Page) -> bool:
         # Vant van-list 滚动到底后实际执行 onLoad；onLoad 在 nextPageAvailable 为 true 时调用 getSchList。
+        # 这里同样不是重写 getSchList，而是触发页面已有方法，并等待 list 追加或翻页结束。
         state = await page.evaluate(
             """
             () => {
@@ -397,19 +436,38 @@ class ChsiSchoolCrawler:
                 if (!vm || typeof vm.getSchList !== 'function') {
                     return {triggered: false, reason: 'no-vue-getSchList'};
                 }
+                const listLength = Array.isArray(vm.list) ? vm.list.length : 0;
                 if (vm.loading) {
-                    return {triggered: false, reason: 'loading', startOfNextPage: vm.startOfNextPage};
+                    return {triggered: false, reason: 'loading', listLength, startOfNextPage: vm.startOfNextPage};
                 }
                 if (!vm.nextPageAvailable) {
-                    return {triggered: false, reason: 'no-next-page', startOfNextPage: vm.startOfNextPage};
+                    return {triggered: false, reason: 'no-next-page', listLength, startOfNextPage: vm.startOfNextPage};
                 }
                 vm.getSchList();
-                return {triggered: true, startOfNextPage: vm.startOfNextPage};
+                return {triggered: true, listLength, startOfNextPage: vm.startOfNextPage};
             }
             """
         )
         logger.info("触发 schlist 下一页状态：%s", state)
-        return bool(state.get("triggered"))
+        if not state.get("triggered"):
+            return False
+        try:
+            await page.wait_for_function(
+                """
+                (previousLength) => {
+                    const app = document.querySelector('#app');
+                    const vm = app && app.__vue__;
+                    if (!vm || vm.loading) return false;
+                    const listLength = Array.isArray(vm.list) ? vm.list.length : 0;
+                    return listLength > previousLength || !vm.nextPageAvailable;
+                }
+                """,
+                arg=state.get("listLength", 0),
+                timeout=8_000,
+            )
+        except PlaywrightTimeoutError:
+            logger.warning("等待 schlist 下一页 getSchList 完成超时：state=%s", state)
+        return True
 
     # 从 schlist 列表页获取学校 ID。
     async def collect_school_ids(self, page: Page, context: BrowserContext) -> list[str]:
