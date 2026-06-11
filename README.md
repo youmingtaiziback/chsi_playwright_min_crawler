@@ -174,7 +174,7 @@ START=10 python crawler.py
 
 ## 原理说明
 
-### 为什么不再调用 schsearch？
+### 为什么不主动调用 schsearch？
 
 `schsearch?start=...` 在部分环境下会被风控重写为随机参数 URL，并返回 `400 Bad Request` 或空 HTML。当前策略改为先从 WAP 列表页：
 
@@ -188,15 +188,32 @@ https://gaokao.chsi.com.cn/wap/sch/schlist
 https://gaokao.chsi.com.cn/wap/sch/schinfomain/{school_id}
 ```
 
-这样每个详情页都由真实 Chromium 以页面导航方式打开，能执行详情页上的 JS 和可能出现的挑战脚本，同时避免依赖容易被拦截的 `schsearch` JSON 接口。
+这样每个详情页都由真实 Chromium 以页面导航方式打开，能执行详情页上的 JS 和可能出现的挑战脚本。WAP 页面自身的 `mounted/getSchList` 仍可能自动请求 `/wap/sch/schsearch`，但程序不再在页面刚加载时额外重复调用它；如果首次请求早于挑战 Cookie 完成而弹出“服务异常”，会关闭弹窗，在 Cookie 预热完成后重新进入 WAP 列表页，让页面自身再自动请求一次。若自动请求仍失败，程序会在同源页面上下文中用 `schlist.html` 的同一套 `postdata` 补发 WAP `schsearch`，并把成功结果写回 `#app.__vue__.list`，便于后续统一提取。
 
 ### 如何从 schlist 获取学校 ID？
 
-程序会访问 `schlist`，等待 DOMContentLoaded、networkidle 和额外渲染时间，然后滚动页面触发移动端懒加载。每轮都会从以下位置提取 ID：
+程序会访问 `schlist`，等待 DOMContentLoaded、networkidle 和额外渲染时间，然后观察 `schlist.html` 源码中 `mounted` 自动触发的 `getSchList()` 是否把结果写入 `#app.__vue__.list`。程序不会再额外主动调用 `getSchList()`，避免在 `/wap/sch/schsearch` 异常时重复弹出“服务异常”。每轮都会从以下位置提取 ID：
 
-- `a[href]` 中的 `/wap/sch/schinfomain/{id}`、`/wap/sch/schinfo/{id}` 等链接；
+- Vue 实例 `#app.__vue__.list` 中的 `item.schId` 字段（优先来源）；
+- `a[href]`、`url` 中的 `/wap/sch/schinfomain/{id}`、`/wap/sch/schinfo/{id}` 等链接；
 - `onclick`、`data-href`、`data-url` 等属性；
-- 页面 HTML / 内联脚本中的 `schId` 字段。
+- 页面 HTML / 内联脚本 / JSON 文本中的 `schId` 字段。
+
+翻页时会优先滚动页面，让 Vant `van-list` 自然触发源码里的 `onLoad`；如果懒加载没有触发，也会用同源 WAP `schsearch` 按当前 `startOfNextPage` 补取下一页。程序不会加入桌面端列表 HTML 兜底，以免掩盖 WAP 列表页自身的问题；如果仍未拿到 ID，会保留 `chsi_network_log.json`、`chsi_warmup_goto.curl.sh`、`chsi_warmup_diagnostics.json` 和 `chsi_warmup_page.html` 供定位。
+
+### 如何定位 warmup 时的“服务异常”？
+
+`page.goto` 成功只代表 `schlist` 主文档返回成功；弹窗通常来自页面随后自动发起的 `/wap/sch/schsearch`、`/wap/sch/querycondition` 等 XHR/fetch。程序会在 warmup 导航前注册请求、响应、requestfailed、console、pageerror 和 dialog 监听，并把以下信息写入 `output/chsi_warmup_diagnostics.json`：
+
+- 关键请求/响应的 URL、方法、资源类型、状态码、POST data 和响应正文预览；
+- Vant 弹窗文本、Vue `#app.__vue__` 状态、`listLength/loading/finished/nextPageAvailable/startOfNextPage`；
+- `snapshot.getSchListEvents`：页面脚本执行前注入的探针会包装根 Vue 实例的 `this.getSchList()`，记录它是否被自动触发、触发时完整 `postdata`、调用前后 Vue 状态，以及内部 `api.syncAjax` 的完整响应/异常；
+- 当前 Cookie 名称和关键 Performance ResourceTiming；
+- `probable_cause` 字段会根据弹窗、`getSchList` 调用和 `schsearch` 响应粗略判断原因。
+
+同时会保存 `output/chsi_warmup_page.html` 作为页面现场快照。优先查看 diagnostics 中 `snapshot.getSchListEvents`：如果没有 `getSchList.call`，说明 `this.getSchList()` 没有自动触发；如果有 `getSchList.call`，继续看同一 `callId` 下的 `api.syncAjax.call` 和 `api.syncAjax.resolved/rejected`，其中会包含完整参数和响应结果。再结合 `/wap/sch/schsearch` 的 `body_preview` 判断是否为 `flag=false`、`服务异常`、非 JSON 或风控页。
+
+如果 diagnostics 中出现 `/wap/sch/schsearch?随机参数=...` 或 `/wap/sch/querycondition?随机参数=...` 且状态码为 400，原因是页面/风控脚本把 WAP 接口 URL 从源码中的原始路径改写成了带随机 query 的地址，而服务端不接受这个变形后的接口 URL。程序会在 Playwright route 层记录 `wap_api_url_normalized` 事件，并把这两个 WAP 接口规范化回无 query 的原始 URL 后继续请求，便于验证是否就是 URL 改写导致的 400。
 
 ### Cookie 如何持久化？
 

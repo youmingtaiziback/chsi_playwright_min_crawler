@@ -22,12 +22,16 @@ import logging
 import os
 # 导入 re 库，用于从链接、脚本和 HTML 中提取学校 ID。
 import re
+# 导入 shlex，用于安全拼接可复现的 curl 命令。
+import shlex
 # 导入 time 库，用于耗时统计。
 import time
 # 导入 datetime，用于生成日志时间与文件元数据时间。
 from datetime import datetime
 # 导入 Path，用于跨平台处理文件路径。
 from pathlib import Path
+# 导入 URL 解析工具，用于识别和规范化被追加随机参数的 WAP 接口 URL。
+from urllib.parse import urlsplit, urlunsplit
 # 导入类型注解，方便理解参数与返回值结构。
 from typing import Any
 
@@ -55,6 +59,12 @@ RAW_PAGES_FILE = OUTPUT_DIR / "chsi_school_pages_raw.json"
 COLLEGES_FILE = OUTPUT_DIR / "chsi_colleges.json"
 # 网络请求调试日志输出文件。
 NETWORK_LOG_FILE = OUTPUT_DIR / "chsi_network_log.json"
+# 列表页导航复现 curl 输出文件。
+WARMUP_CURL_FILE = OUTPUT_DIR / "chsi_warmup_goto.curl.sh"
+# warmup 阶段诊断信息输出文件。
+WARMUP_DIAGNOSTICS_FILE = OUTPUT_DIR / "chsi_warmup_diagnostics.json"
+# warmup 阶段页面 HTML 快照输出文件。
+WARMUP_HTML_FILE = OUTPUT_DIR / "chsi_warmup_page.html"
 # 学校列表页：用于执行 JS 挑战并提取学校 ID。
 SCHOOL_LIST_URL = "https://gaokao.chsi.com.cn/wap/sch/schlist"
 # 院校库详情页：通过学校 ID 获取院校库信息。
@@ -142,6 +152,14 @@ class ChsiSchoolCrawler:
         self.colleges: list[dict[str, Any]] = []
         # 用于保存每次页面访问的调试日志。
         self.network_logs: list[dict[str, Any]] = []
+        # 避免对同一个页面重复注册 schsearch / warmup 调试监听器。
+        self.schsearch_debug_attached = False
+        # 避免对同一个页面重复注入 getSchList 探针。
+        self.get_schlist_probe_installed = False
+        # 避免对同一个页面重复安装 WAP 接口 URL 规范化路由。
+        self.wap_api_route_installed = False
+        # warmup 期间的请求、响应、console、弹窗等诊断事件。
+        self.warmup_debug_events: list[dict[str, Any]] = []
 
     # 判断页面或响应是否像阿里云 / WAF / JS 挑战页。
     def is_challenge_text(self, text: str) -> bool:
@@ -179,12 +197,546 @@ class ChsiSchoolCrawler:
         # 输出每个重点 Cookie 是否出现。
         logger.info("关键 Cookie 状态=%s", {name: name in names for name in important})
 
+    # 写出和 page.goto 列表页导航同源参数构造的 curl，便于在终端复现首跳请求。
+    async def write_warmup_goto_curl(self, page: Page, context: BrowserContext, url: str, wait_until: str, timeout_ms: int) -> None:
+        # page.goto 对列表页是 GET 导航；curl 中复用相同 URL、timeout、当前 User-Agent 和当前上下文已有 Cookie。
+        user_agent = await page.evaluate("() => navigator.userAgent")
+        cookies = await context.cookies(url)
+        cookie_header = "; ".join(f"{cookie.get('name')}={cookie.get('value')}" for cookie in cookies if cookie.get("name"))
+        command = [
+            "curl",
+            "--location",
+            "--request",
+            "GET",
+            "--max-time",
+            str(max(1, int(timeout_ms / 1000))),
+            "--compressed",
+            "--header",
+            f"User-Agent: {user_agent}",
+            "--header",
+            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "--header",
+            "Accept-Language: zh-CN,zh;q=0.9",
+        ]
+        if cookie_header:
+            command.extend(["--header", f"Cookie: {cookie_header}"])
+        command.append(url)
+        curl_text = f"# page.goto wait_until={wait_until} timeout_ms={timeout_ms}\n" + " ".join(shlex.quote(part) for part in command) + "\n"
+        WARMUP_CURL_FILE.write_text(curl_text, encoding="utf-8")
+        logger.info("已写出学校列表页 goto 复现 curl：%s", WARMUP_CURL_FILE)
+
+    # 判断某个请求是否需要纳入 warmup 诊断范围，避免把统计、图片等无关请求刷屏。
+    def is_warmup_debug_request(self, url: str, resource_type: str = "") -> bool:
+        # schlist 主文档、列表接口、筛选条件接口、站点 JS / 风控脚本都和“服务异常”定位相关。
+        important_patterns = [
+            "/wap/sch/schlist",
+            "/wap/sch/schsearch",
+            "/wap/sch/querycondition",
+            "/gaokao/wap/assets/js/app-",
+            ".c69d89a.js",
+        ]
+        if any(pattern in url for pattern in important_patterns):
+            return True
+        # XHR / fetch 失败最可能导致页面弹“服务异常”，统一记录。
+        return resource_type in {"xhr", "fetch"} and ("gaokao.chsi.com.cn" in url or "chei.com.cn" in url)
+
+    # 对敏感请求头做轻量脱敏：保留 Cookie 名称，隐藏具体值。
+    def redact_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        redacted: dict[str, str] = {}
+        for key, value in headers.items():
+            lower_key = key.lower()
+            if lower_key == "cookie":
+                names = []
+                for item in value.split(";"):
+                    name = item.split("=", 1)[0].strip()
+                    if name:
+                        names.append(name)
+                redacted[key] = "; ".join(f"{name}=<redacted>" for name in names)
+            elif lower_key in {"authorization", "proxy-authorization"}:
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = value
+        return redacted
+
+    # 追加 warmup 诊断事件，并限制内存中保存的事件数量。
+    def append_warmup_debug_event(self, event: dict[str, Any]) -> None:
+        event.setdefault("recorded_at", datetime.now().isoformat(timespec="seconds"))
+        self.warmup_debug_events.append(event)
+        # 保留最近 300 条，足够覆盖 schlist 首屏和 schsearch 失败链路。
+        if len(self.warmup_debug_events) > 300:
+            self.warmup_debug_events = self.warmup_debug_events[-300:]
+
+    # 判断 URL 是否是会被随机参数污染后返回 400 的 WAP 列表接口。
+    def is_wap_school_api_url(self, url: str) -> bool:
+        parsed = urlsplit(url)
+        return parsed.netloc == "gaokao.chsi.com.cn" and parsed.path in {"/wap/sch/schsearch", "/wap/sch/querycondition"}
+
+    # 移除 WAF/脚本追加到 WAP 列表接口上的随机查询参数，避免 schsearch/querycondition 因 URL 变形返回 400。
+    def normalize_wap_school_api_url(self, url: str) -> str:
+        parsed = urlsplit(url)
+        if not self.is_wap_school_api_url(url) or not parsed.query:
+            return url
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", parsed.fragment))
+
+    # 在页面请求发出前规范化 WAP 列表接口 URL；保留 method、headers、post_data，仅移除随机 query。
+    async def install_wap_api_url_normalizer(self, page: Page) -> None:
+        if self.wap_api_route_installed:
+            return
+        self.wap_api_route_installed = True
+
+        async def normalize_route(route: Any) -> None:
+            request = route.request
+            normalized_url = self.normalize_wap_school_api_url(request.url)
+            if normalized_url != request.url:
+                event = {
+                    "event": "wap_api_url_normalized",
+                    "original_url": request.url,
+                    "normalized_url": normalized_url,
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "post_data": (request.post_data or "")[:2000],
+                }
+                self.append_warmup_debug_event(event)
+                logger.warning("规范化 WAP 接口 URL，移除随机 query：%s -> %s", request.url, normalized_url)
+                await route.continue_(url=normalized_url)
+                return
+            await route.continue_()
+
+        await page.route("**/wap/sch/schsearch**", normalize_route)
+        await page.route("**/wap/sch/querycondition**", normalize_route)
+
+    # 在页面脚本执行前注入探针，监听 schlist.html 中 this.getSchList() 是否自动触发。
+    async def install_get_schlist_probe(self, page: Page) -> None:
+        if self.get_schlist_probe_installed:
+            return
+        self.get_schlist_probe_installed = True
+        await page.add_init_script(
+            """
+            (() => {
+                if (window.__chsiGetSchListProbeInstalled) return;
+                window.__chsiGetSchListProbeInstalled = true;
+                window.__chsiGetSchListEvents = [];
+                window.__chsiGetSchListSeq = 0;
+                window.__chsiCurrentGetSchListCallId = null;
+
+                const now = () => new Date().toISOString();
+                const safeClone = (value) => {
+                    try { return JSON.parse(JSON.stringify(value)); } catch (error) { return String(value); }
+                };
+                const vueState = (vm) => vm ? {
+                    listLength: Array.isArray(vm.list) ? vm.list.length : 0,
+                    loading: Boolean(vm.loading),
+                    finished: Boolean(vm.finished),
+                    error: Boolean(vm.error),
+                    nextPageAvailable: Boolean(vm.nextPageAvailable),
+                    startOfNextPage: vm.startOfNextPage
+                } : null;
+                const calcPostdata = (vm) => {
+                    const zgsxTem = Array.isArray(vm && vm.zgsxTem) ? vm.zgsxTem : [];
+                    return {
+                        start: (vm && vm.startOfNextPage) || 0,
+                        yxmc: (vm && vm.yxmc) || '',
+                        yxls: (vm && vm.yxls) || '',
+                        ssdm: (vm && vm.ssdm) || '',
+                        zgsx: zgsxTem.length > 0 ? zgsxTem[0] : '',
+                        yxjbz: (vm && vm.yxjbzValue2) || '',
+                        bxlx: (vm && vm.bxlx) || '',
+                        xlcc: (vm && vm.xlcc) || ''
+                    };
+                };
+                const emit = (event) => {
+                    const item = Object.assign({recordedAt: now()}, event);
+                    window.__chsiGetSchListEvents.push(item);
+                    if (window.__chsiGetSchListEvents.length > 100) {
+                        window.__chsiGetSchListEvents = window.__chsiGetSchListEvents.slice(-100);
+                    }
+                    try { console.info('[chsi-getSchList] ' + JSON.stringify(item)); } catch (error) {}
+                };
+                const installApiWrapper = (api) => {
+                    if (!api || typeof api.syncAjax !== 'function' || api.__chsiSyncAjaxWrapped) return;
+                    const originalSyncAjax = api.syncAjax;
+                    api.__chsiSyncAjaxWrapped = true;
+                    api.syncAjax = function(method, url, options) {
+                        const callId = window.__chsiCurrentGetSchListCallId;
+                        const eventBase = {
+                            event: 'api.syncAjax.call',
+                            callId,
+                            method,
+                            url,
+                            options: safeClone(options || null)
+                        };
+                        emit(eventBase);
+                        const result = originalSyncAjax.apply(this, arguments);
+                        if (result && typeof result.then === 'function') {
+                            result.then(
+                                (data) => emit({
+                                    event: 'api.syncAjax.resolved',
+                                    callId,
+                                    method,
+                                    url,
+                                    response: safeClone(data)
+                                }),
+                                (error) => emit({
+                                    event: 'api.syncAjax.rejected',
+                                    callId,
+                                    method,
+                                    url,
+                                    error: String(error && (error.stack || error.message || error))
+                                })
+                            );
+                        } else {
+                            emit({event: 'api.syncAjax.returned_non_promise', callId, method, url, result: safeClone(result)});
+                        }
+                        return result;
+                    };
+                    emit({event: 'api.syncAjax.wrapped'});
+                };
+                const wrapVm = (vm, reason) => {
+                    if (!vm || typeof vm.getSchList !== 'function' || vm.__chsiGetSchListWrapped) return false;
+                    const originalGetSchList = vm.getSchList;
+                    vm.__chsiGetSchListWrapped = true;
+                    vm.getSchList = function() {
+                        const callId = ++window.__chsiGetSchListSeq;
+                        const postdata = calcPostdata(this);
+                        emit({
+                            event: 'getSchList.call',
+                            callId,
+                            reason,
+                            postdata,
+                            stateBefore: vueState(this),
+                            stack: (new Error()).stack
+                        });
+                        installApiWrapper(window.api);
+                        window.__chsiCurrentGetSchListCallId = callId;
+                        try {
+                            return originalGetSchList.apply(this, arguments);
+                        } finally {
+                            window.__chsiCurrentGetSchListCallId = null;
+                            setTimeout(() => emit({event: 'getSchList.state_after_0ms', callId, state: vueState(this)}), 0);
+                            setTimeout(() => emit({event: 'getSchList.state_after_1000ms', callId, state: vueState(this), listSample: Array.isArray(this.list) ? safeClone(this.list.slice(0, 3)) : []}), 1000);
+                            setTimeout(() => emit({event: 'getSchList.state_after_5000ms', callId, state: vueState(this), listSample: Array.isArray(this.list) ? safeClone(this.list.slice(0, 3)) : []}), 5000);
+                        }
+                    };
+                    emit({event: 'getSchList.wrapped', reason, state: vueState(vm)});
+                    return true;
+                };
+                const installVueMixin = (Vue) => {
+                    if (!Vue || typeof Vue.mixin !== 'function' || Vue.__chsiGetSchListMixinInstalled) return;
+                    Vue.__chsiGetSchListMixinInstalled = true;
+                    Vue.mixin({
+                        created: function() {
+                            try {
+                                const isRootApp = this.$options && (this.$options.el === '#app' || this.$options.el === document.querySelector('#app'));
+                                if (isRootApp || typeof this.getSchList === 'function') {
+                                    wrapVm(this, 'vue_global_mixin_created');
+                                }
+                            } catch (error) {
+                                emit({event: 'getSchList.wrap_error', error: String(error && (error.stack || error.message || error))});
+                            }
+                        }
+                    });
+                    emit({event: 'vue.mixin.installed'});
+                };
+                const installApiSetter = () => {
+                    if (Object.prototype.hasOwnProperty.call(window, 'api') && window.api) {
+                        installApiWrapper(window.api);
+                        return;
+                    }
+                    let apiValue;
+                    try {
+                        Object.defineProperty(window, 'api', {
+                            configurable: true,
+                            get() { return apiValue; },
+                            set(value) {
+                                apiValue = value;
+                                installApiWrapper(value);
+                            }
+                        });
+                    } catch (error) {
+                        emit({event: 'api.setter.install_error', error: String(error)});
+                    }
+                };
+                installApiSetter();
+                if (window.Vue) {
+                    installVueMixin(window.Vue);
+                } else {
+                    let vueValue;
+                    try {
+                        Object.defineProperty(window, 'Vue', {
+                            configurable: true,
+                            get() { return vueValue; },
+                            set(value) {
+                                vueValue = value;
+                                installVueMixin(value);
+                                Object.defineProperty(window, 'Vue', {value, writable: true, configurable: true});
+                            }
+                        });
+                    } catch (error) {
+                        emit({event: 'vue.setter.install_error', error: String(error)});
+                    }
+                }
+                emit({event: 'probe.installed'});
+            })();
+            """
+        )
+
+    # 监听 warmup 期间的关键请求、响应、失败请求、console、页面异常和原生 dialog。
+    def attach_schsearch_debug_listeners(self, page: Page) -> None:
+        if self.schsearch_debug_attached:
+            return
+        self.schsearch_debug_attached = True
+
+        async def record_request(request: Any) -> None:
+            if not self.is_warmup_debug_request(request.url, request.resource_type):
+                return
+            try:
+                headers = await request.all_headers()
+            except Exception:
+                headers = request.headers
+            post_data = request.post_data or ""
+            self.append_warmup_debug_event(
+                {
+                    "event": "request",
+                    "url": request.url,
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "headers": self.redact_headers(headers),
+                    "post_data": post_data[:2000],
+                }
+            )
+            if "/wap/sch/schsearch" in request.url:
+                logger.info("schsearch 请求：method=%s post_data=%s", request.method, post_data[:500])
+
+        async def record_response(response: Any) -> None:
+            if not self.is_warmup_debug_request(response.url, response.request.resource_type):
+                return
+            request = response.request
+            post_data = request.post_data or ""
+            body_preview = ""
+            # 只读取 schsearch 或异常响应正文；避免读取大 JS / HTML 造成额外开销。
+            if "/wap/sch/schsearch" in response.url or response.status >= 400:
+                try:
+                    body_preview = (await response.text())[:2000]
+                except Exception as exc:
+                    body_preview = f"<读取响应正文失败：{exc}>"
+            event = {
+                "event": "response",
+                "url": response.url,
+                "status": response.status,
+                "ok": response.ok,
+                "request_method": request.method,
+                "resource_type": request.resource_type,
+                "post_data": post_data[:2000],
+                "body_preview": body_preview,
+            }
+            self.append_warmup_debug_event(event)
+            if "/wap/sch/schsearch" in response.url:
+                log_item = {
+                    "request": {
+                        "url": request.url,
+                        "method": request.method,
+                        "post_data": post_data[:1000],
+                        "mode": "schsearch_auto_by_page",
+                    },
+                    "response": {
+                        "status": response.status,
+                        "url": response.url,
+                        "ok": response.ok,
+                        "body_preview": body_preview,
+                    },
+                    "recorded_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                self.network_logs.append(log_item)
+                logger.warning(
+                    "schsearch 响应：status=%s ok=%s post_data=%s body_preview=%s",
+                    response.status,
+                    response.ok,
+                    post_data[:300],
+                    body_preview[:300].replace("\n", " "),
+                )
+
+        def record_request_failed(request: Any) -> None:
+            if not self.is_warmup_debug_request(request.url, request.resource_type):
+                return
+            failure = request.failure or ""
+            self.append_warmup_debug_event(
+                {
+                    "event": "requestfailed",
+                    "url": request.url,
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "failure": failure,
+                    "post_data": (request.post_data or "")[:2000],
+                }
+            )
+            logger.warning("warmup 请求失败：method=%s url=%s failure=%s", request.method, request.url, failure)
+
+        def record_console(message: Any) -> None:
+            text = message.text
+            if message.type not in {"error", "warning"} and not any(keyword in text for keyword in ["服务异常", "schsearch", "getSchList", "chsi-getSchList", "error", "Error"]):
+                return
+            event = {
+                "event": "console",
+                "type": message.type,
+                "text": text[:2000],
+                "location": message.location,
+            }
+            if text.startswith("[chsi-getSchList] "):
+                event["event"] = "getSchList.console"
+                try:
+                    event["payload"] = json.loads(text.replace("[chsi-getSchList] ", "", 1))
+                except Exception:
+                    pass
+            self.append_warmup_debug_event(event)
+            logger.info("页面 console：type=%s text=%s", message.type, text[:300])
+
+        def record_page_error(error: Exception) -> None:
+            self.append_warmup_debug_event({"event": "pageerror", "message": str(error)[:2000]})
+            logger.warning("页面 JS 异常：%s", error)
+
+        async def record_dialog(dialog: Any) -> None:
+            self.append_warmup_debug_event({"event": "native_dialog", "type": dialog.type, "message": dialog.message})
+            logger.warning("页面原生 dialog：type=%s message=%s", dialog.type, dialog.message)
+            await dialog.dismiss()
+
+        page.on("request", lambda request: asyncio.create_task(record_request(request)))
+        page.on("response", lambda response: asyncio.create_task(record_response(response)))
+        page.on("requestfailed", record_request_failed)
+        page.on("console", record_console)
+        page.on("pageerror", record_page_error)
+        page.on("dialog", lambda dialog: asyncio.create_task(record_dialog(dialog)))
+
+    # 保存 warmup 现场快照：Vue 状态、弹窗文本、Cookie 名称、关键网络事件、HTML。
+    async def save_warmup_diagnostics(self, page: Page, context: BrowserContext, stage: str) -> None:
+        snapshot = await page.evaluate(
+            """
+            () => {
+                const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                const app = document.querySelector('#app');
+                const vm = app && app.__vue__;
+                const dialogText = Array.from(document.querySelectorAll('.van-dialog, .van-toast, [role="dialog"]'))
+                    .map((node) => clean(node.innerText || node.textContent || ''))
+                    .filter(Boolean);
+                const importantResourcePattern = new RegExp('/wap/sch/schsearch|/wap/sch/querycondition|/wap/sch/schlist|app-2[.]0[.]7|c69d89a');
+                const resources = performance.getEntriesByType('resource')
+                    .filter((item) => importantResourcePattern.test(item.name))
+                    .map((item) => ({
+                        name: item.name,
+                        initiatorType: item.initiatorType,
+                        startTime: Math.round(item.startTime),
+                        duration: Math.round(item.duration),
+                        transferSize: item.transferSize || 0,
+                        encodedBodySize: item.encodedBodySize || 0,
+                        decodedBodySize: item.decodedBodySize || 0
+                    }));
+                return {
+                    url: location.href,
+                    title: document.title,
+                    readyState: document.readyState,
+                    bodyTextPreview: clean(document.body ? document.body.innerText : '').slice(0, 1000),
+                    dialogText,
+                    vueState: vm ? {
+                        hasVm: true,
+                        listLength: Array.isArray(vm.list) ? vm.list.length : 0,
+                        loading: Boolean(vm.loading),
+                        finished: Boolean(vm.finished),
+                        error: Boolean(vm.error),
+                        nextPageAvailable: Boolean(vm.nextPageAvailable),
+                        startOfNextPage: vm.startOfNextPage,
+                        yxmc: vm.yxmc || '',
+                        ssdm: vm.ssdm || '',
+                        yxls: vm.yxls || '',
+                        xlcc: vm.xlcc || '',
+                        zgsx: Array.isArray(vm.zgsx) ? vm.zgsx : []
+                    } : {hasVm: false},
+                    resources,
+                    getSchListEvents: Array.isArray(window.__chsiGetSchListEvents) ? window.__chsiGetSchListEvents : []
+                };
+            }
+            """
+        )
+        cookies = await context.cookies(SCHOOL_LIST_URL)
+        cookie_summary = sorted(cookie.get("name", "") for cookie in cookies)
+        diagnostics = {
+            "stage": stage,
+            "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            "snapshot": snapshot,
+            "cookie_names": cookie_summary,
+            "events": self.warmup_debug_events,
+            "probable_cause": self.infer_warmup_failure_cause(snapshot),
+        }
+        WARMUP_DIAGNOSTICS_FILE.write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            html = await page.content()
+            WARMUP_HTML_FILE.write_text(html, encoding="utf-8")
+        except Exception as exc:
+            logger.warning("写出 warmup HTML 快照失败：%s", exc)
+        logger.info("已保存 warmup 诊断：%s html=%s cause=%s", WARMUP_DIAGNOSTICS_FILE, WARMUP_HTML_FILE, diagnostics["probable_cause"])
+
+    # 根据页面状态和 schsearch 响应粗略推断失败原因，方便从日志快速定位。
+    def infer_warmup_failure_cause(self, snapshot: dict[str, Any]) -> str:
+        dialog_text = " ".join(snapshot.get("dialogText") or [])
+        get_schlist_events = snapshot.get("getSchListEvents") or []
+        get_schlist_calls = [event for event in get_schlist_events if event.get("event") == "getSchList.call"]
+        get_schlist_api_results = [event for event in get_schlist_events if event.get("event") in {"api.syncAjax.resolved", "api.syncAjax.rejected"}]
+        schsearch_events = [event for event in self.warmup_debug_events if "/wap/sch/schsearch" in str(event.get("url", ""))]
+        failed_events = [event for event in schsearch_events if event.get("event") in {"response", "requestfailed"} and (event.get("status", 200) >= 400 or event.get("failure") or "服务异常" in str(event.get("body_preview", "")))]
+        rewritten_api_400_events = [
+            event
+            for event in self.warmup_debug_events
+            if event.get("event") == "response"
+            and event.get("status") == 400
+            and ("/wap/sch/schsearch?" in str(event.get("url", "")) or "/wap/sch/querycondition?" in str(event.get("url", "")))
+        ]
+        normalized_events = [event for event in self.warmup_debug_events if event.get("event") == "wap_api_url_normalized"]
+        document_400_events = [
+            event
+            for event in self.warmup_debug_events
+            if event.get("event") == "response"
+            and event.get("resource_type") == "document"
+            and event.get("status") == 400
+            and str(event.get("url", "")).rstrip("/").endswith("/wap/sch/schlist")
+        ]
+        if normalized_events:
+            latest = normalized_events[-1]
+            return f"检测到 WAP 接口 URL 被追加随机 query，已在路由层规范化：{latest.get('original_url')} -> {latest.get('normalized_url')}。如果仍失败，请查看规范化后的 response。"
+        if rewritten_api_400_events:
+            latest = rewritten_api_400_events[-1]
+            return f"400 原因明确：WAP 接口被追加随机 query 后请求，服务端拒绝。url={latest.get('url')}；应移除 query 后请求原始接口。"
+        if document_400_events:
+            latest = document_400_events[-1]
+            return f"schlist 主文档本身返回 400：url={latest.get('url')}；通常是当前 Cookie/风控状态已被标记，需要清理 storage_state 或重新完成挑战。"
+        if "服务异常" in dialog_text and failed_events:
+            latest = failed_events[-1]
+            return f"this.getSchList 已触发 {len(get_schlist_calls)} 次；/wap/sch/schsearch 请求失败或返回服务异常；status={latest.get('status')} failure={latest.get('failure')}，详情见 diagnostics events 和 snapshot.getSchListEvents。"
+        if get_schlist_calls and get_schlist_api_results:
+            latest_result = get_schlist_api_results[-1]
+            response = latest_result.get("response") or latest_result.get("error")
+            return f"this.getSchList 已触发 {len(get_schlist_calls)} 次；最近一次 api.syncAjax 结果={str(response)[:300]}。"
+        if not get_schlist_calls:
+            return "未捕获到 this.getSchList 自动触发；请查看 snapshot.getSchListEvents 中是否只有 probe/vue.mixin 安装事件，可能是 Vue 探针未在页面脚本前注入或页面脚本未正常执行。"
+        if "服务异常" in dialog_text:
+            return "页面已出现 Vant 服务异常弹窗，但未捕获到 schsearch 响应；可能是监听注册过晚、请求被浏览器/扩展拦截，或接口在脚本层被封装吞掉。"
+        vue_state = snapshot.get("vueState") or {}
+        if vue_state.get("hasVm") and vue_state.get("listLength") == 0 and not vue_state.get("loading"):
+            return "Vue 实例存在但 list 为空且未加载中；需要查看 schsearch 响应 body_preview 判断接口返回 flag=false、空列表还是非 JSON。"
+        return "未发现明确服务异常；请查看 diagnostics events 中的 request/response/console/pageerror。"
+
     # 访问列表页，等待 JS 挑战自动完成并写入 Cookie。
     async def warmup(self, page: Page, context: BrowserContext) -> None:
         # 输出预热开始日志。
         logger.info("开始访问学校列表页：%s", SCHOOL_LIST_URL)
+        # 确保即使单独调用 warmup，也会先安装 URL 规范化、注入 getSchList 探针并注册诊断监听器，再发起导航。
+        await self.install_wap_api_url_normalizer(page)
+        await self.install_get_schlist_probe(page)
+        self.attach_schsearch_debug_listeners(page)
         # 访问列表页，等待 DOMContentLoaded 即可，不强求 networkidle，避免某些统计请求长时间挂起。
-        response = await page.goto(SCHOOL_LIST_URL, wait_until="domcontentloaded", timeout=60_000)
+        goto_url = SCHOOL_LIST_URL
+        goto_wait_until = "domcontentloaded"
+        goto_timeout = 60_000
+        # 在真正 page.goto 前写出同一 URL / timeout / 当前 Cookie 构造的 curl，便于复现首跳请求。
+        await self.write_warmup_goto_curl(page, context, goto_url, goto_wait_until, goto_timeout)
+        response = await page.goto(goto_url, wait_until=goto_wait_until, timeout=goto_timeout)
         # 如果拿到响应对象，则输出状态码。
         if response:
             logger.info("学校列表页响应：status=%s url=%s", response.status, response.url)
@@ -204,6 +756,8 @@ class ChsiSchoolCrawler:
             logger.warning("学校列表页等待 networkidle 超时，继续后续流程")
         # 额外等待 2 秒，给阿里云 JS 挑战和列表接口写 Cookie / 渲染 DOM 的时间。
         await page.wait_for_timeout(2_000)
+        # 保存 warmup 现场，用于定位“服务异常”到底来自哪个请求/响应。
+        await self.save_warmup_diagnostics(page, context, "warmup_after_networkidle")
         # 打印 Cookie 概况，用于判断挑战是否完成。
         await self.log_cookie_summary(context)
         # 保存当前 storage_state，后续启动可复用 Cookie。
@@ -211,55 +765,259 @@ class ChsiSchoolCrawler:
         # 输出保存状态日志。
         logger.info("已保存 storage_state：%s", STATE_FILE)
 
-    # 从字符串中提取学校 ID，覆盖 schinfomain 链接、schinfo 链接和脚本中的 schId。
+    # 从字符串中提取学校 ID，覆盖 schinfomain 链接、schinfo 链接和脚本/JSON 中的 schId。
     def extract_school_ids_from_text(self, text: str) -> list[str]:
         # 使用列表保持发现顺序，使用集合去重。
         ids: list[str] = []
         seen: set[str] = set()
+
+        # 内部小工具：只收集纯数字 ID，并保持首次出现的顺序。
+        def add_school_id(value: str | int | None) -> None:
+            if value is None:
+                return
+            school_id = str(value).strip()
+            if not re.fullmatch(r"\d+", school_id):
+                return
+            if school_id not in seen:
+                ids.append(school_id)
+                seen.add(school_id)
+
         # 正则覆盖 /wap/sch/schinfomain/123、/wap/sch/schinfo/123 等链接。
         patterns = [
             r"/wap/sch/(?:schinfomain|schinfo|schdetail)/(\d+)",
             r"schinfomain/(\d+)",
-            r"schId[\"'\s:=]+(\d+)",
+            # schlist.html 源码中列表数据字段为 item.schId；接口 JSON 常见形式为 "schId": 123。
+            r"[\"']?schId[\"']?\s*[:=]\s*[\"']?(\d+)",
         ]
         # 逐个模式匹配。
         for pattern in patterns:
             for match in re.finditer(pattern, text):
-                school_id = match.group(1)
-                if school_id not in seen:
-                    ids.append(school_id)
-                    seen.add(school_id)
+                add_school_id(match.group(1))
         # 返回保持原始顺序的学校 ID。
         return ids
 
-    # 读取当前列表页 DOM，并从链接、onclick、HTML 中提取学校 ID。
+    # 从对象中递归提取 schId 字段，覆盖 Vue 实例 data.list 和 schsearch 接口 JSON。
+    def extract_school_ids_from_object(self, value: Any) -> list[str]:
+        # 使用列表保持发现顺序，使用集合去重。
+        ids: list[str] = []
+        seen: set[str] = set()
+
+        # 内部小工具：只收集纯数字 ID，并保持首次出现的顺序。
+        def add_school_id(raw_value: Any) -> None:
+            if raw_value is None:
+                return
+            school_id = str(raw_value).strip()
+            if not re.fullmatch(r"\d+", school_id):
+                return
+            if school_id not in seen:
+                ids.append(school_id)
+                seen.add(school_id)
+
+        # 递归遍历 dict/list，遇到 schId 立即收集。
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    if key == "schId":
+                        add_school_id(child)
+                    walk(child)
+            elif isinstance(node, list):
+                for child in node:
+                    walk(child)
+
+        walk(value)
+        # 返回保持原始顺序的学校 ID。
+        return ids
+
+    # 等待 schlist 源码中 mounted 自动触发的 Vue 列表请求结束。
+    async def wait_for_schlist_vue_data(self, page: Page) -> bool:
+        # schlist.html 在 mounted 中已经会调用 this.getSchList()；这里不要再次主动调用，避免重复触发
+        # /wap/sch/schsearch 并弹出“服务异常”对话框。这里只观察 Vue 状态，必要时关闭错误弹窗后等待重新导航。
+        for attempt in range(1, 8):
+            state = await page.evaluate(
+                """
+                () => {
+                    const app = document.querySelector('#app');
+                    const vm = app && app.__vue__;
+                    const dialog = Array.from(document.querySelectorAll('.van-dialog, [role="dialog"]'))
+                        .map((node) => (node.innerText || node.textContent || '').trim())
+                        .find(Boolean) || '';
+                    if (!vm) {
+                        return {hasVm: false, listLength: 0, loading: false, nextPageAvailable: false, dialog};
+                    }
+                    return {
+                        hasVm: true,
+                        listLength: Array.isArray(vm.list) ? vm.list.length : 0,
+                        loading: Boolean(vm.loading),
+                        nextPageAvailable: Boolean(vm.nextPageAvailable),
+                        finished: Boolean(vm.finished),
+                        startOfNextPage: vm.startOfNextPage,
+                        dialog
+                    };
+                }
+                """
+            )
+            dialog = str(state.get("dialog") or "")
+            if state.get("listLength", 0) > 0:
+                logger.info("schlist Vue 列表数据已就绪：%s", state)
+                return True
+            if dialog:
+                logger.warning("schlist 页面出现弹窗，停止等待当前 WAP 列表：%s", dialog.replace("\n", " | "))
+                await self.save_warmup_diagnostics(page, page.context, "vue_dialog_detected")
+                await self.close_page_dialog_if_present(page)
+                return False
+            if state.get("hasVm") and not state.get("loading") and state.get("finished"):
+                logger.warning("schlist Vue 列表请求已结束但没有数据，准备重新加载：%s", state)
+                return False
+            logger.info("等待 schlist mounted 列表请求：attempt=%s state=%s", attempt, state)
+            await page.wait_for_timeout(1_000)
+        return False
+
+    # 在 WAP 页面上下文中按 schlist.html 的 postdata 结构补发一次 schsearch，并把成功结果写回 Vue list。
+    async def fetch_schsearch_into_vue(self, page: Page) -> bool:
+        # 只在页面自动 mounted/getSchList 失败后使用；仍然使用 WAP 页同源 fetch、当前 Cookie 和同一套参数。
+        result = await page.evaluate(
+            """
+            async () => {
+                const app = document.querySelector('#app');
+                const vm = app && app.__vue__;
+                if (!vm) {
+                    return {ok: false, reason: 'no-vue'};
+                }
+                const zgsxTem = Array.isArray(vm.zgsxTem) ? vm.zgsxTem : [];
+                const postdata = {
+                    start: vm.startOfNextPage || 0,
+                    yxmc: vm.yxmc || '',
+                    yxls: vm.yxls || '',
+                    ssdm: vm.ssdm || '',
+                    zgsx: zgsxTem.length > 0 ? zgsxTem[0] : '',
+                    yxjbz: vm.yxjbzValue2 || '',
+                    bxlx: vm.bxlx || '',
+                    xlcc: vm.xlcc || ''
+                };
+                const body = new URLSearchParams();
+                Object.keys(postdata).forEach((key) => body.append(key, postdata[key] == null ? '' : String(postdata[key])));
+                const response = await fetch('/wap/sch/schsearch', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'Accept': 'application/json, text/javascript, */*; q=0.01',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body
+                });
+                const text = await response.text();
+                let data = null;
+                try {
+                    data = JSON.parse(text);
+                } catch (error) {
+                    return {ok: false, reason: 'json-parse-failed', status: response.status, postdata, textPreview: text.slice(0, 500)};
+                }
+                if (!data || !data.flag || !data.msg || !Array.isArray(data.msg.list)) {
+                    return {ok: false, reason: 'api-flag-false', status: response.status, postdata, data};
+                }
+                vm.list = Array.isArray(vm.list) ? vm.list.concat(data.msg.list) : data.msg.list;
+                vm.loading = false;
+                vm.nextPageAvailable = Boolean(data.msg.nextPageAvailable);
+                vm.startOfNextPage = data.msg.startOfNextPage;
+                vm.finished = !vm.nextPageAvailable;
+                return {
+                    ok: true,
+                    status: response.status,
+                    added: data.msg.list.length,
+                    total: Array.isArray(vm.list) ? vm.list.length : 0,
+                    nextPageAvailable: vm.nextPageAvailable,
+                    startOfNextPage: vm.startOfNextPage,
+                    postdata
+                };
+            }
+            """
+        )
+        if result.get("ok"):
+            logger.info("schsearch 同源 fetch 恢复成功：%s", result)
+            return True
+        logger.warning("schsearch 同源 fetch 恢复失败：%s", result)
+        self.network_logs.append(
+            {
+                "request": {"url": "/wap/sch/schsearch", "method": "POST", "mode": "schsearch_same_origin_recovery", "post_data": result.get("postdata")},
+                "response": {"status": result.get("status"), "ok": False, "body_preview": result.get("textPreview") or result.get("data")},
+                "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        return False
+
+    # 如果页面出现 Vant/浏览器弹窗，尝试点击确认关闭，避免遮挡后续页面操作。
+    async def close_page_dialog_if_present(self, page: Page) -> bool:
+        return await page.evaluate(
+            """
+            () => {
+                const candidates = Array.from(document.querySelectorAll('.van-dialog__confirm, .van-button, button'));
+                const button = candidates.find((node) => /确定|确认|关闭|OK/i.test((node.innerText || node.textContent || '').trim()));
+                if (!button) return false;
+                button.click();
+                return true;
+            }
+            """
+        )
+
+    # 读取当前列表页 DOM、Vue 实例和页面源码，并提取学校 ID。
     async def extract_school_ids_from_page(self, page: Page) -> list[str]:
-        # 在页面中收集所有可能包含学校详情地址的 DOM 内容。
+        # 在页面中收集所有可能包含学校详情地址或 schId 的 DOM / Vue 内容。
         snapshot = await page.evaluate(
             """
             () => {
                 const attrs = [];
-                for (const node of document.querySelectorAll('a[href], [onclick], [data-href], [data-url]')) {
-                    for (const name of ['href', 'onclick', 'data-href', 'data-url']) {
+                for (const node of document.querySelectorAll('a[href], [onclick], [data-href], [data-url], [url]')) {
+                    for (const name of ['href', 'onclick', 'data-href', 'data-url', 'url']) {
                         const value = node.getAttribute(name);
                         if (value) attrs.push(value);
                     }
                 }
+                const app = document.querySelector('#app');
+                const vm = app && app.__vue__;
+                const vueState = vm ? {
+                    list: Array.isArray(vm.list) ? vm.list : [],
+                    startOfNextPage: vm.startOfNextPage,
+                    nextPageAvailable: Boolean(vm.nextPageAvailable),
+                    loading: Boolean(vm.loading),
+                    finished: Boolean(vm.finished)
+                } : null;
                 return {
                     url: location.href,
                     title: document.title,
                     attrs,
+                    vueState,
                     html: document.documentElement.outerHTML
                 };
             }
             """
         )
-        # 合并属性与 HTML 后统一用 Python 正则提取，便于后续维护。
+        # 使用列表保持不同来源的发现顺序，使用集合去重。
+        school_ids: list[str] = []
+        seen: set[str] = set()
+
+        # 内部小工具：合并某个来源提取到的 ID。
+        def extend_ids(values: list[str]) -> None:
+            for school_id in values:
+                if school_id not in seen:
+                    school_ids.append(school_id)
+                    seen.add(school_id)
+
+        # schlist.html 源码显示真实学校 ID 位于 Vue list 的 item.schId，优先读取渲染后的 Vue 状态。
+        extend_ids(self.extract_school_ids_from_object(snapshot.get("vueState")))
+        # 合并属性与 HTML 后统一用 Python 正则兜底提取，便于后续维护。
         combined = "\n".join(snapshot.get("attrs") or []) + "\n" + (snapshot.get("html") or "")
-        # 提取学校 ID。
-        school_ids = self.extract_school_ids_from_text(combined)
+        extend_ids(self.extract_school_ids_from_text(combined))
+        vue_state = snapshot.get("vueState") or {}
         # 输出当前页面提取结果。
-        logger.info("当前列表页提取学校 ID 数量=%s url=%s title=%s", len(school_ids), snapshot.get("url"), snapshot.get("title"))
+        logger.info(
+            "当前列表页提取学校 ID 数量=%s url=%s title=%s vue_list=%s next=%s",
+            len(school_ids),
+            snapshot.get("url"),
+            snapshot.get("title"),
+            len(vue_state.get("list") or []),
+            vue_state.get("nextPageAvailable"),
+        )
         # 返回学校 ID。
         return school_ids
 
@@ -282,10 +1040,52 @@ class ChsiSchoolCrawler:
             """
         )
 
+
+    # 等待滚动后由 Vant van-list/onLoad 自然触发的下一页请求。
+    async def wait_for_schlist_lazy_page(self, page: Page, previous_length: int) -> bool:
+        # 不主动调用 vm.getSchList()，避免在 schsearch 已异常时不断弹出“服务异常”。
+        # 只在滚动后观察 list 是否增长，或页面是否明确没有下一页。
+        try:
+            await page.wait_for_function(
+                """
+                (previousLength) => {
+                    const app = document.querySelector('#app');
+                    const vm = app && app.__vue__;
+                    if (!vm) return false;
+                    const listLength = Array.isArray(vm.list) ? vm.list.length : 0;
+                    const dialog = Array.from(document.querySelectorAll('.van-dialog, [role="dialog"]'))
+                        .map((node) => (node.innerText || node.textContent || '').trim())
+                        .find(Boolean) || '';
+                    return listLength > previousLength || (!vm.loading && !vm.nextPageAvailable) || Boolean(dialog);
+                }
+                """,
+                arg=previous_length,
+                timeout=5_000,
+            )
+        except PlaywrightTimeoutError:
+            logger.info("等待 schlist 懒加载下一页超时：previous_length=%s", previous_length)
+            return False
+        dialog_closed = await self.close_page_dialog_if_present(page)
+        if dialog_closed:
+            logger.warning("schlist 懒加载出现服务异常弹窗，已关闭并停止主动加载 WAP 列表")
+            return False
+        return True
+
     # 从 schlist 列表页获取学校 ID。
     async def collect_school_ids(self, page: Page, context: BrowserContext) -> list[str]:
         # 先访问列表页并执行挑战。
         await self.warmup(page, context)
+        # schlist.html 的 mounted 会自动触发 getSchList；这里只等待结果，不再主动重复调用 schsearch。
+        list_ready = await self.wait_for_schlist_vue_data(page)
+        # 从日志看，首次无 storage_state 时 schsearch 可能早于挑战 Cookie 完成而弹“服务异常”。
+        # warmup 已经拿到 acw_tc / aliyungf_tc / CHSICC_CLIENTFLAGGAOKAO 后，重新导航一次让 mounted 自动重试。
+        if not list_ready:
+            logger.warning("首次 schlist 自动列表请求未成功；已完成 Cookie 预热，重新访问 WAP 列表页再等待一次")
+            await self.warmup(page, context)
+            list_ready = await self.wait_for_schlist_vue_data(page)
+        # 如果页面 mounted 自动请求仍失败，则在同源页面上下文中用相同 postdata 补发一次，避免空列表直接终止。
+        if not list_ready:
+            await self.fetch_schsearch_into_vue(page)
         # 使用列表保持顺序，使用集合去重。
         school_ids: list[str] = []
         seen: set[str] = set()
@@ -308,12 +1108,16 @@ class ChsiSchoolCrawler:
             if self.max_schools > 0 and len(school_ids) >= self.start + self.max_schools:
                 logger.info("已提取到 START + MAX_SCHOOLS 所需数量，停止滚动列表页")
                 break
-            # 尝试点击加载更多，再滚动到底部。
+            # 先滚动到底部，让 Vant van-list 自然触发 onLoad；不主动调用 getSchList，避免重复弹“服务异常”。
+            previous_length = len(current_ids)
             clicked = await self.click_load_more_if_present(page)
             await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1_500)
-            # 如果连续 3 轮既没有新增 ID，也没有可点击加载更多，则认为列表已到底。
-            if added == 0 and not clicked:
+            loaded_next_page = await self.wait_for_schlist_lazy_page(page, previous_length)
+            if not loaded_next_page:
+                loaded_next_page = await self.fetch_schsearch_into_vue(page)
+            await page.wait_for_timeout(500)
+            # 如果连续 3 轮既没有新增 ID，也没有可点击/懒加载更多，则认为 WAP 列表已到底或不可用。
+            if added == 0 and not clicked and not loaded_next_page:
                 stale_rounds += 1
                 if stale_rounds >= 3:
                     logger.info("列表页连续 %s 轮没有新增学校 ID，停止滚动", stale_rounds)
@@ -491,6 +1295,8 @@ class ChsiSchoolCrawler:
                 context = await browser.new_context(locale="zh-CN")
             # 创建一个页面，列表页和详情页都在同一页面/上下文中完成。
             page = await context.new_page()
+            # 记录 schsearch 自动请求/响应，便于定位服务异常。
+            self.attach_schsearch_debug_listeners(page)
             try:
                 # 从 schlist 页面提取学校 ID。
                 school_ids = await self.collect_school_ids(page, context)
